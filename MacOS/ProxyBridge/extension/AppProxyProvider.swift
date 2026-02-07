@@ -234,7 +234,7 @@ class AppProxyProvider: NETransparentProxyProvider {
     /// - Note: This is a workaround for Apple's Network Extension API limitation that doesn't
     ///         provide direct access to process names or paths. It may fail in some edge cases
     ///         due to security restrictions or race conditions.
-    private func getProcessPath(from auditToken: Data) -> String? {
+    private func getExecutablePath(from auditToken: Data) -> String? {
         guard auditToken.count == MemoryLayout<audit_token_t>.size else {
             return nil
         }
@@ -246,7 +246,7 @@ class AppProxyProvider: NETransparentProxyProvider {
         
         let pid = audit_token_to_pid(token)
         
-        let pathBufferSize = Int(PROC_PIDPATHINFO_MAXSIZE)  // From Darwin module
+        let pathBufferSize = Int(PROC_PIDPATHINFO_MAXSIZE)
         var pathBuffer = [CChar](repeating: 0, count: pathBufferSize)
         
         let result = pathBuffer.withUnsafeMutableBufferPointer { bufferPtr in
@@ -280,7 +280,7 @@ class AppProxyProvider: NETransparentProxyProvider {
         
         // Try to get executable path from audit token if available
         if let auditToken = metaData.sourceAppAuditToken {
-            executablePath = getProcessPath(from: auditToken)
+            executablePath = getExecutablePath(from: auditToken)
         }
         
         return (bundleId, executablePath)
@@ -1244,13 +1244,7 @@ class AppProxyProvider: NETransparentProxyProvider {
             }
             
             // Try matching against executable path first (if available), then bundle ID
-            var processMatched = false
-            if let execPath = executablePath {
-                processMatched = rule.matchesProcess(execPath)
-            }
-            if !processMatched {
-                processMatched = rule.matchesProcess(bundleId)
-            }
+            let processMatched = executablePath.map { rule.matchesProcess($0) } ?? false || rule.matchesProcess(bundleId)
             
             if !processMatched {
                 continue
