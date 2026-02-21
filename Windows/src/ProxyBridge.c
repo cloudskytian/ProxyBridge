@@ -19,7 +19,15 @@
 #define VERSION "3.2.0"
 #define PID_CACHE_SIZE 1024
 #define PID_CACHE_TTL_MS 1000
-#define NUM_PACKET_THREADS 4
+// Single packet-processor thread eliminates TCP packet reordering.
+// With multiple threads each racing to WinDivertRecv+WinDivertSend, thread N+1
+// can re-inject its segment before thread N injects segment N, causing the
+// relay's TCP stack to send DUPACKs back to the browser.  The browser
+// interprets 3+ DUPACKs as loss, halves its congestion window, and upload
+// throughput collapses ~50%.  A single ordered thread prevents this entirely.
+// One thread is fast enough: at 200 Mbps with 1460-byte segments there are
+// ~17 000 packets/sec; a single core processes well over 200 000 packets/sec.
+#define NUM_PACKET_THREADS 1
 #define CONNECTION_HASH_SIZE 256
 #define SOCKS5_BUFFER_SIZE 1024
 #define HTTP_BUFFER_SIZE 1024
@@ -66,6 +74,20 @@ typedef struct {
     SOCKET from_socket;
     SOCKET to_socket;
 } TRANSFER_CONFIG;
+
+// Two-thread bidirectional relay: each direction runs in its own thread so
+// a slow proxy (upload) never stalls the download pipe and vice-versa.
+typedef struct {
+    SOCKET sock_client;   // app-side socket
+    SOCKET sock_proxy;    // proxy-side socket
+    volatile LONG refs;   // ref-count; last thread out closes both sockets
+} RELAY_PAIR;
+
+typedef struct {
+    RELAY_PAIR *pair;
+    SOCKET from;
+    SOCKET to;
+} ONE_WAY_CONFIG;
 
 // Track logged connections to avoid dupli
 typedef struct LOGGED_CONNECTION {
@@ -2035,8 +2057,14 @@ static DWORD WINAPI connection_handler(LPVOID arg)
         return 0;
     }
 
-    configure_tcp_socket(socks_sock, 524288, 30000);
-    configure_tcp_socket(client_sock, 524288, 30000);
+    // 4 MB kernel socket buffers for the relay sockets.
+    // The upload path writes from client→proxy over a real network with non-zero
+    // RTT; a small (512 KB) send buffer causes send_all() to block the moment
+    // the proxy's receive window fills up, which stalls the relay loop and
+    // triggers TCP flow-control on the client side → massive upload throughput
+    // loss.  4 MB gives plenty of headroom even at high bitrates / high RTT.
+    configure_tcp_socket(socks_sock, 4194304, 30000);  // 4 MB – proxy connection
+    configure_tcp_socket(client_sock, 4194304, 30000); // 4 MB – app connection
 
     memset(&socks_addr, 0, sizeof(socks_addr));
     socks_addr.sin_family = AF_INET;
@@ -2091,73 +2119,109 @@ static DWORD WINAPI connection_handler(LPVOID arg)
     return 0;
 }
 
+// One-directional relay: reads from `from` and writes to `to`.
+// Runs as a dedicated thread so upload and download never block each other.
+// Uses a shared RELAY_PAIR reference count for safe socket cleanup:
+//   - whichever direction finishes first calls shutdown() on both sockets,
+//     which causes the sibling thread's recv() to return 0 and exit cleanly.
+//   - the last thread to exit (refs drops to 0) closes both sockets and
+//     frees the shared RELAY_PAIR.
+static DWORD WINAPI one_way_relay(LPVOID arg)
+{
+    ONE_WAY_CONFIG *cfg = (ONE_WAY_CONFIG *)arg;
+    RELAY_PAIR *pair = cfg->pair;
+    SOCKET from = cfg->from;
+    SOCKET to   = cfg->to;
+    free(cfg);
+
+    char *buf = (char *)malloc(131072);  // 128 KB per-direction buffer
+    if (buf)
+    {
+        int len;
+        while ((len = recv(from, buf, 131072, 0)) > 0)
+        {
+            if (send_all(to, buf, len) == SOCKET_ERROR)
+                break;
+        }
+        free(buf);
+    }
+
+    // Signal the sibling relay to stop by shutting down both sockets.
+    // shutdown() is safe to call from any thread; it just drains/resets the
+    // socket without closing the handle, so the other thread's recv() returns 0.
+    shutdown(pair->sock_client, SD_BOTH);
+    shutdown(pair->sock_proxy,  SD_BOTH);
+
+    // Last thread out closes and frees everything.
+    if (InterlockedDecrement(&pair->refs) == 0)
+    {
+        closesocket(pair->sock_client);
+        closesocket(pair->sock_proxy);
+        free(pair);
+    }
+
+    return 0;
+}
+
+// Bidirectional relay: spawns one thread for upload (client→proxy) and runs
+// the download (proxy→client) direction in the calling thread.  Blocks until
+// both directions have finished so the caller (connection_handler) can return
+// cleanly and its thread handle can be closed.
 static DWORD WINAPI transfer_handler(LPVOID arg)
 {
     TRANSFER_CONFIG *config = (TRANSFER_CONFIG *)arg;
-    SOCKET sock1 = config->from_socket;  // client socket
-    SOCKET sock2 = config->to_socket;     // proxy socket
-    char buf[131072];  // 128KB buffer for high-speed transfers
-    int len;
-
+    SOCKET sock_client = config->from_socket;
+    SOCKET sock_proxy  = config->to_socket;
     free(config);
 
-    // monitor BOTH socket in one thread
-    while (TRUE)
+    RELAY_PAIR *pair = (RELAY_PAIR *)malloc(sizeof(RELAY_PAIR));
+    if (!pair)
     {
-        fd_set readfds;
-        struct timeval timeout;
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 1;
+    }
+    pair->sock_client = sock_client;
+    pair->sock_proxy  = sock_proxy;
+    pair->refs        = 2;
 
-        FD_ZERO(&readfds);
-        FD_SET(sock1, &readfds);  // client
-        FD_SET(sock2, &readfds);  // proxy
+    // Upload: client → proxy  (dedicated thread — may block on slow proxy send)
+    ONE_WAY_CONFIG *up = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
+    // Download: proxy → client (runs in this thread — loopback, rarely blocks)
+    ONE_WAY_CONFIG *dn = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
 
-        // short timeout for responsive upload/download (50ms)
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 50000;  // 50ms
-
-        int ready = select(0, &readfds, NULL, NULL, &timeout);
-
-        if (ready == SOCKET_ERROR)
-        {
-
-            break;
-        }
-
-        if (ready == 0)
-        {
-            // timeotjust continue to check again
-            continue;
-        }
-
-        // check if  client to proxy
-        if (FD_ISSET(sock1, &readfds))
-        {
-            len = recv(sock1, buf, sizeof(buf), 0);
-            if (len <= 0)
-                break;
-
-            if (send_all(sock2, buf, len) == SOCKET_ERROR)
-                goto cleanup;
-        }
-
-        // check if proxyto client
-        if (FD_ISSET(sock2, &readfds))
-        {
-            len = recv(sock2, buf, sizeof(buf), 0);
-            if (len <= 0)
-                break;
-
-            if (send_all(sock1, buf, len) == SOCKET_ERROR)
-                goto cleanup;
-        }
+    if (!up || !dn)
+    {
+        free(up);
+        free(dn);
+        free(pair);
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 1;
     }
 
-cleanup:
-    // graceful shutdown
-    shutdown(sock1, SD_BOTH);
-    shutdown(sock2, SD_BOTH);
-    closesocket(sock1);
-    closesocket(sock2);
+    up->pair = pair;  up->from = sock_client;  up->to = sock_proxy;
+    dn->pair = pair;  dn->from = sock_proxy;   dn->to = sock_client;
+
+    // Spawn the upload relay in its own thread.
+    HANDLE upload_thread = CreateThread(NULL, 0, one_way_relay, up, 0, NULL);
+    if (!upload_thread)
+    {
+        free(up);
+        free(dn);
+        free(pair);
+        closesocket(sock_client);
+        closesocket(sock_proxy);
+        return 1;
+    }
+
+    // Run the download relay in this thread (blocks until done).
+    one_way_relay(dn);
+
+    // Wait for the upload relay thread to finish, then clean up its handle.
+    WaitForSingleObject(upload_thread, INFINITE);
+    CloseHandle(upload_thread);
+
     return 0;
 }
 
@@ -3134,8 +3198,19 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         return FALSE;
     }
 
-    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 8192);
-    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_TIME, 8);  // 8ms for low latency
+    // WINDIVERT_PARAM_QUEUE_LENGTH: max packets in queue (range 32–16384).
+    // Under heavy upload the kernel enqueues bursts of outbound packets faster
+    // than the 4 packet threads can drain them; a full queue drops arriving
+    // packets → TCP sees loss → retransmit + congestion-window halving.
+    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 16384);
+    // WINDIVERT_PARAM_QUEUE_TIME: ms a packet waits before being dropped
+    // (range 100–16000, default 2000).  The old value of 8 ms was below the
+    // minimum (100 ms) and caused aggressive packet drops under any sustained
+    // upload load, directly producing the 40-60% upload throughput loss.
+    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000);
+    // WINDIVERT_PARAM_QUEUE_SIZE: max total bytes in queue (range 65535–33553920).
+    // Raise to the maximum so a burst of large packets never hits a byte cap.
+    WinDivertSetParam(windivert_handle, WINDIVERT_PARAM_QUEUE_SIZE, 33553920);
 
     for (int i = 0; i < NUM_PACKET_THREADS; i++)
     {
