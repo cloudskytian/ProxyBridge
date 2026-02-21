@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Windows.Input;
+using Avalonia.Controls;
 using ProxyBridge.GUI.Services;
 using ProxyBridge.GUI.Common;
 
@@ -21,6 +22,9 @@ public class ProxySettingsViewModel : ViewModelBase
     // edit panel state
     private bool _isEditPanelOpen;
     private uint _editingConfigId;
+    private Window? _window;
+    private readonly Func<uint, int>? _countRulesUsingConfig;
+    private readonly Action<uint>? _deleteRulesForConfig;
 
     private string _newType = "SOCKS5";
     private string _newHost = "";
@@ -130,16 +134,22 @@ public class ProxySettingsViewModel : ViewModelBase
     public ICommand StartTestCommand { get; }
     public ICommand CloseCommand { get; }
 
+    public void SetWindow(Window window) => _window = window;
+
     public ProxySettingsViewModel(
         ObservableCollection<ProxyConfig> proxyConfigs,
         ProxyBridgeService? proxyService,
         Action? onConfigsChanged,
-        Action? onClose)
+        Action? onClose,
+        Func<uint, int>? countRulesUsingConfig = null,
+        Action<uint>? deleteRulesForConfig = null)
     {
         _proxyConfigs = proxyConfigs;
         _proxyService = proxyService;
         _onConfigsChanged = onConfigsChanged;
         _onClose = onClose;
+        _countRulesUsingConfig = countRulesUsingConfig;
+        _deleteRulesForConfig = deleteRulesForConfig;
 
         OpenAddPanelCommand = new RelayCommand(() =>
         {
@@ -224,12 +234,12 @@ public class ProxySettingsViewModel : ViewModelBase
         DeleteConfigCommand = new RelayCommandWithParameter<ProxyConfig>(config =>
         {
             if (config == null) return;
-            if (_proxyService != null)
-                _proxyService.DeleteProxyConfig(config.Id);
-            _proxyConfigs.Remove(config);
-            _onConfigsChanged?.Invoke();
+            _ = DeleteConfigAsync(config);
         });
 
+        // ---------------------------------------------------------------
+        // Helpers
+        // ---------------------------------------------------------------
         OpenTestPanelCommand = new RelayCommandWithParameter<ProxyConfig>(config =>
         {
             if (config == null) return;
@@ -283,6 +293,90 @@ public class ProxySettingsViewModel : ViewModelBase
         foreach (var c in _proxyConfigs)
             if (c.Id == configId) return c;
         return null;
+    }
+
+    private async System.Threading.Tasks.Task DeleteConfigAsync(ProxyConfig config)
+    {
+        int affectedCount = _countRulesUsingConfig?.Invoke(config.Id) ?? 0;
+
+        if (affectedCount > 0)
+        {
+            string ruleWord = affectedCount == 1 ? "rule" : "rules";
+            bool confirmed = await ShowConfirmAsync(
+                "Delete Proxy Config",
+                $"{affectedCount} {ruleWord} using this proxy config will also be deleted.\n\nContinue?");
+            if (!confirmed)
+                return;
+        }
+
+        _deleteRulesForConfig?.Invoke(config.Id);
+
+        if (_proxyService != null)
+            _proxyService.DeleteProxyConfig(config.Id);
+
+        _proxyConfigs.Remove(config);
+        _onConfigsChanged?.Invoke();
+    }
+
+    private async System.Threading.Tasks.Task<bool> ShowConfirmAsync(string title, string message)
+    {
+        if (_window == null)
+            return true;
+
+        bool result = false;
+
+        var dialog = new Window
+        {
+            Title = title,
+            Width = 420,
+            Height = 190,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            CanResize = false,
+            Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#FF2D2D30"))
+        };
+
+        var stack = new StackPanel { Margin = new Avalonia.Thickness(20), Spacing = 16 };
+
+        stack.Children.Add(new Avalonia.Controls.TextBlock
+        {
+            Text = message,
+            TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+            Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.White),
+            FontSize = 13
+        });
+
+        var buttons = new StackPanel
+        {
+            Orientation = Avalonia.Layout.Orientation.Horizontal,
+            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
+            Spacing = 10
+        };
+
+        var deleteBtn = new Button
+        {
+            Content = "Delete",
+            Width = 80,
+            Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#FFCC3333")),
+            Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.White)
+        };
+        deleteBtn.Click += (s, e) => { result = true; dialog.Close(); };
+
+        var cancelBtn = new Button
+        {
+            Content = "Cancel",
+            Width = 80,
+            Background = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Color.Parse("#FF3C3C3C")),
+            Foreground = new Avalonia.Media.SolidColorBrush(Avalonia.Media.Colors.White)
+        };
+        cancelBtn.Click += (s, e) => dialog.Close();
+
+        buttons.Children.Add(deleteBtn);
+        buttons.Children.Add(cancelBtn);
+        stack.Children.Add(buttons);
+        dialog.Content = stack;
+
+        await dialog.ShowDialog(_window);
+        return result;
     }
 
     private static bool IsValidIpOrDomain(string input)

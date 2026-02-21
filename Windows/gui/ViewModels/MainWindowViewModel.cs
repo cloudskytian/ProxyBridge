@@ -396,10 +396,24 @@ public class MainWindowViewModel : ViewModelBase
                 proxyConfigs: ProxyConfigs,
                 proxyService: _proxyService,
                 onConfigsChanged: SaveConfigurationInternal,
-                onClose: () => window.Close()
+                onClose: () => window.Close(),
+                countRulesUsingConfig: (id) =>
+                    ProxyRules.Count(r => r.Action == "PROXY" && r.ProxyConfigId == id),
+                deleteRulesForConfig: (id) =>
+                {
+                    var toDelete = ProxyRules.Where(r => r.Action == "PROXY" && r.ProxyConfigId == id).ToList();
+                    foreach (var rule in toDelete)
+                    {
+                        _proxyService?.DeleteRule(rule.RuleId);
+                        ProxyRules.Remove(rule);
+                    }
+                    if (toDelete.Count > 0)
+                        SaveConfigurationInternal();
+                }
             );
 
             window.DataContext = viewModel;
+            viewModel.SetWindow(window);
 
             if (_mainWindow != null)
             {
