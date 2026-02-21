@@ -57,23 +57,6 @@
                             <TextBlock Text="Delete Selected"/>
                         </StackPanel>
                     </Button>
-                    <Button Command="{Binding ExportRulesCommand}"
-                            Classes="secondary"
-                            Padding="12,8"
-                            IsEnabled="{Binding HasSelectedRules}">
-                        <StackPanel Orientation="Horizontal" Spacing="6">
-                            <TextBlock Text="↑" FontSize="14"/>
-                            <TextBlock Text="Export"/>
-                        </StackPanel>
-                    </Button>
-                    <Button Command="{Binding ImportRulesCommand}"
-                            Classes="secondary"
-                            Padding="12,8">
-                        <StackPanel Orientation="Horizontal" Spacing="6">
-                            <TextBlock Text="↓" FontSize="14"/>
-                            <TextBlock Text="Import"/>
-                        </StackPanel>
-                    </Button>
                     <Button Content="{Binding Loc.ButtonAdd}"
                             Command="{Binding AddRuleCommand}"/>
                 </StackPanel>

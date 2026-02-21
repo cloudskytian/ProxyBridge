@@ -1,7 +1,6 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Linq;
-using System.Text.Json.Serialization;
 using System.Windows.Input;
 using Avalonia.Controls;
 using ProxyBridge.GUI.Services;
@@ -86,8 +85,6 @@ public class ProxyRulesViewModel : ViewModelBase
     public ICommand DeleteRuleCommand { get; }
     public ICommand EditRuleCommand { get; }
     public ICommand ToggleSelectAllCommand { get; }
-    public ICommand ExportRulesCommand { get; }
-    public ICommand ImportRulesCommand { get; }
     public ICommand DeleteSelectedRulesCommand { get; }
 
     public bool HasSelectedRules => ProxyRules.Any(r => r.IsSelected);
@@ -311,30 +308,6 @@ public class ProxyRulesViewModel : ViewModelBase
             OnPropertyChanged(nameof(AllRulesSelected));
         });
 
-        ExportRulesCommand = new RelayCommand(async () =>
-        {
-            try
-            {
-                await ExportSelectedRulesAsync();
-            }
-            catch (Exception ex)
-            {
-                await ShowMessageAsync("Export Failed", $"Failed to export rules: {ex.Message}");
-            }
-        });
-
-        ImportRulesCommand = new RelayCommand(async () =>
-        {
-            try
-            {
-                await ImportRulesAsync();
-            }
-            catch (Exception ex)
-            {
-                await ShowMessageAsync("Import Failed", $"Failed to import rules: {ex.Message}");
-            }
-        });
-
         DeleteSelectedRulesCommand = new RelayCommand(async () =>
         {
             var selectedRules = ProxyRules.Where(r => r.IsSelected).ToList();
@@ -451,136 +424,6 @@ public class ProxyRulesViewModel : ViewModelBase
         }
     }
 
-    private async System.Threading.Tasks.Task ExportSelectedRulesAsync()
-    {
-        if (_window == null)
-            return;
-
-        var selectedRules = ProxyRules.Where(r => r.IsSelected).ToList();
-
-        if (!selectedRules.Any())
-        {
-            await ShowMessageAsync("No Rules Selected", "Please select at least one rule to export.");
-            return;
-        }
-
-        var saveDialog = new Avalonia.Platform.Storage.FilePickerSaveOptions
-        {
-            Title = "Export Proxy Rules",
-            SuggestedFileName = "ProxyBridge-Rules.json",
-            FileTypeChoices = new[]
-            {
-                new Avalonia.Platform.Storage.FilePickerFileType("JSON Files")
-                {
-                    Patterns = new[] { "*.json" }
-                }
-            }
-        };
-
-        var result = await _window.StorageProvider.SaveFilePickerAsync(saveDialog);
-
-        if (result != null)
-        {
-            var exportData = selectedRules.Select(r => new ProxyRuleExport
-            {
-                ProcessNames = r.ProcessName,
-                TargetHosts = r.TargetHosts,
-                TargetPorts = r.TargetPorts,
-                Protocol = r.Protocol,
-                Action = r.Action,
-                Enabled = r.IsEnabled
-            }).ToList();
-
-            var json = System.Text.Json.JsonSerializer.Serialize(exportData, ProxyRuleJsonContext.Default.ListProxyRuleExport);
-
-            await System.IO.File.WriteAllTextAsync(result.Path.LocalPath, json);
-
-            await ShowMessageAsync("Export Successful", $"Exported {selectedRules.Count} rule(s) to:\n{result.Path.LocalPath}");
-        }
-    }
-
-    private async System.Threading.Tasks.Task ImportRulesAsync()
-    {
-        if (_window == null)
-            return;
-
-        if (_proxyService == null)
-        {
-            await ShowMessageAsync("Import Failed", "Proxy service is not available.");
-            return;
-        }
-
-        var openDialog = new Avalonia.Platform.Storage.FilePickerOpenOptions
-        {
-            Title = "Import Proxy Rules",
-            AllowMultiple = false,
-            FileTypeFilter = new[]
-            {
-                new Avalonia.Platform.Storage.FilePickerFileType("JSON Files")
-                {
-                    Patterns = new[] { "*.json" }
-                }
-            }
-        };
-
-        var result = await _window.StorageProvider.OpenFilePickerAsync(openDialog);
-
-        if (result != null && result.Count > 0)
-        {
-            var filePath = result[0].Path.LocalPath;
-
-            var json = await System.IO.File.ReadAllTextAsync(filePath);
-
-            var importedRules = System.Text.Json.JsonSerializer.Deserialize(json, ProxyRuleJsonContext.Default.ListProxyRuleExport);
-
-            if (importedRules != null && importedRules.Count > 0)
-            {
-                int successCount = 0;
-                foreach (var ruleData in importedRules)
-                {
-                    var ruleId = _proxyService.AddRule(
-                        ruleData.ProcessNames,
-                        ruleData.TargetHosts,
-                        ruleData.TargetPorts,
-                        ruleData.Protocol,
-                        ruleData.Action
-                    );
-
-                    if (ruleId > 0)
-                    {
-                        var newRule = new ProxyRule
-                        {
-                            RuleId = ruleId,
-                            ProcessName = ruleData.ProcessNames,
-                            TargetHosts = ruleData.TargetHosts,
-                            TargetPorts = ruleData.TargetPorts,
-                            Protocol = ruleData.Protocol,
-                            Action = ruleData.Action,
-                            IsEnabled = ruleData.Enabled,
-                            Index = ProxyRules.Count + 1
-                        };
-
-                        newRule.PropertyChanged += Rule_PropertyChanged;
-                        ProxyRules.Add(newRule);
-
-                        if (!ruleData.Enabled)
-                        {
-                            _proxyService.DisableRule(ruleId);
-                        }
-
-                        successCount++;
-                    }
-                }
-
-                await ShowMessageAsync("Import Successful", $"Imported {successCount} rule(s) from:\n{filePath}");
-            }
-            else
-            {
-                await ShowMessageAsync("Import Failed", "No valid rules found in the selected file.");
-            }
-        }
-    }
-
     private async System.Threading.Tasks.Task ShowMessageAsync(string title, string message)
     {
         if (_window == null)
@@ -635,17 +478,6 @@ public class ProxyRulesViewModel : ViewModelBase
     }
 }
 
-// same format as macos export
-public class ProxyRuleExport
-{
-    public string ProcessNames { get; set; } = "*";
-    public string TargetHosts { get; set; } = "*";
-    public string TargetPorts { get; set; } = "*";
-    public string Protocol { get; set; } = "BOTH";
-    public string Action { get; set; } = "DIRECT";
-    public bool Enabled { get; set; } = true;
-}
-
 public class RuleActionItem
 {
     public string Label { get; }
@@ -658,14 +490,4 @@ public class RuleActionItem
         Action = action;
         ProxyConfigId = proxyConfigId;
     }
-}
-
-[JsonSourceGenerationOptions(
-    WriteIndented = true,
-    PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
-    PropertyNameCaseInsensitive = true)]
-[JsonSerializable(typeof(System.Collections.Generic.List<ProxyRuleExport>))]
-[JsonSerializable(typeof(ProxyRuleExport))]
-internal partial class ProxyRuleJsonContext : JsonSerializerContext
-{
 }
