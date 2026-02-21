@@ -19,6 +19,7 @@ public class ProxyConfigEntry
 
 public class AppConfig
 {
+    public string ConfigFileVersion { get; set; } = "2.0";
     public bool DnsViaProxy { get; set; } = true;
     public bool LocalhostViaProxy { get; set; } = false;
     public bool IsTrafficLoggingEnabled { get; set; } = true;
@@ -113,27 +114,33 @@ public static class ConfigManager
         return AtomicFileHelper.AtomicWrite(ConfigFilePath, json);
     }
 
+    private const string CurrentVersion = "2.0";
+
     public static AppConfig LoadConfig()
     {
         var json = AtomicFileHelper.SafeReadFile(ConfigFilePath);
         if (json == null)
-        {
             return new AppConfig();
-        }
 
         try
         {
             var config = JsonSerializer.Deserialize(json, AppConfigJsonContext.Default.AppConfig);
             if (config != null)
             {
+                if (config.ConfigFileVersion != CurrentVersion)
+                {
+                    try { File.Delete(ConfigFilePath); } catch { }
+                    return new AppConfig();
+                }
+
                 config.ProxyRules ??= new List<ProxyRuleConfig>();
                 config.ProxyConfigs ??= new List<ProxyConfigEntry>();
-
                 return config;
             }
         }
         catch { }
 
+        try { File.Delete(ConfigFilePath); } catch { }
         return new AppConfig();
     }
 
