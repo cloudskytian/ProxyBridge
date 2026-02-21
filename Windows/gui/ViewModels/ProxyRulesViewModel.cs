@@ -21,7 +21,7 @@ public class ProxyRulesViewModel : ViewModelBase
     private string _newTargetHosts = "*";
     private string _newTargetPorts = "*";
     private string _newProtocol = "TCP"; // TCP, UDP, or BOTH
-    private string _newProxyAction = "PROXY";
+    private RuleActionItem? _selectedRuleAction;
     private string _processNameError = "";
     private Action<ProxyRule>? _onAddRule;
     private Action? _onClose;
@@ -30,6 +30,7 @@ public class ProxyRulesViewModel : ViewModelBase
     private Window? _window;
 
     public ObservableCollection<ProxyRule> ProxyRules { get; }
+    public ObservableCollection<RuleActionItem> AvailableActions { get; } = new();
 
     public bool IsAddRuleViewOpen
     {
@@ -65,10 +66,10 @@ public class ProxyRulesViewModel : ViewModelBase
         set => SetProperty(ref _newProtocol, value);
     }
 
-    public string NewProxyAction
+    public RuleActionItem? SelectedRuleAction
     {
-        get => _newProxyAction;
-        set => SetProperty(ref _newProxyAction, value);
+        get => _selectedRuleAction;
+        set => SetProperty(ref _selectedRuleAction, value);
     }
 
     public string ProcessNameError
@@ -111,17 +112,24 @@ public class ProxyRulesViewModel : ViewModelBase
         NewTargetHosts = "*";
         NewTargetPorts = "*";
         NewProtocol = "TCP";
-        NewProxyAction = "PROXY";
+        SelectedRuleAction = AvailableActions.FirstOrDefault();
         ProcessNameError = "";
     }
 
-    public ProxyRulesViewModel(ObservableCollection<ProxyRule> proxyRules, Action<ProxyRule> onAddRule, Action onClose, ProxyBridgeService? proxyService = null, Action? onConfigChanged = null)
+    public ProxyRulesViewModel(ObservableCollection<ProxyRule> proxyRules, ObservableCollection<ProxyConfig> availableProxyConfigs, Action<ProxyRule> onAddRule, Action onClose, ProxyBridgeService? proxyService = null, Action? onConfigChanged = null)
     {
         ProxyRules = proxyRules;
         _onAddRule = onAddRule;
         _onClose = onClose;
         _proxyService = proxyService;
         _onConfigChanged = onConfigChanged;
+
+        // proxy configs first, then direct/block at end
+        foreach (var pc in availableProxyConfigs)
+            AvailableActions.Add(new RuleActionItem(pc.DisplayName, "PROXY", pc.Id));
+        AvailableActions.Add(new RuleActionItem("Direct", "DIRECT", 0));
+        AvailableActions.Add(new RuleActionItem("Block", "BLOCK", 0));
+        _selectedRuleAction = AvailableActions.FirstOrDefault();
 
         foreach (var rule in ProxyRules)
         {
@@ -158,16 +166,21 @@ public class ProxyRulesViewModel : ViewModelBase
 
             if (_isEditMode && _proxyService != null)
             {
-                if (_proxyService.EditRule(_currentEditingRuleId, NewProcessName, NewTargetHosts, NewTargetPorts, NewProtocol, NewProxyAction))
+                var existRule = ProxyRules.FirstOrDefault(r => r.RuleId == _currentEditingRuleId);
+                string action = SelectedRuleAction?.Action ?? "PROXY";
+                uint pcId = SelectedRuleAction?.ProxyConfigId ?? 0;
+
+                if (_proxyService.EditRule(_currentEditingRuleId, NewProcessName, NewTargetHosts, NewTargetPorts, NewProtocol, action, pcId))
                 {
-                    var existingRule = ProxyRules.FirstOrDefault(r => r.RuleId == _currentEditingRuleId);
-                    if (existingRule != null)
+                    if (existRule != null)
                     {
-                        existingRule.ProcessName = NewProcessName;
-                        existingRule.TargetHosts = NewTargetHosts;
-                        existingRule.TargetPorts = NewTargetPorts;
-                        existingRule.Protocol = NewProtocol;
-                        existingRule.Action = NewProxyAction;
+                        existRule.ProcessName = NewProcessName;
+                        existRule.TargetHosts = NewTargetHosts;
+                        existRule.TargetPorts = NewTargetPorts;
+                        existRule.Protocol = NewProtocol;
+                        existRule.Action = action;
+                        existRule.ProxyConfigId = pcId;
+                        existRule.ProxyConfigDisplay = action == "PROXY" ? (SelectedRuleAction?.Label ?? "") : "";
                     }
                     _onConfigChanged?.Invoke();
                 }
@@ -177,14 +190,18 @@ public class ProxyRulesViewModel : ViewModelBase
             }
             else
             {
+                string action = SelectedRuleAction?.Action ?? "PROXY";
+                uint pcId = SelectedRuleAction?.ProxyConfigId ?? 0;
                 var newRule = new ProxyRule
                 {
                     ProcessName = NewProcessName,
                     TargetHosts = NewTargetHosts,
                     TargetPorts = NewTargetPorts,
                     Protocol = NewProtocol,
-                    Action = NewProxyAction,
-                    IsEnabled = true
+                    Action = action,
+                    IsEnabled = true,
+                    ProxyConfigId = pcId,
+                    ProxyConfigDisplay = action == "PROXY" ? (SelectedRuleAction?.Label ?? "") : ""
                 };
 
                 newRule.PropertyChanged += Rule_PropertyChanged;
@@ -276,7 +293,9 @@ public class ProxyRulesViewModel : ViewModelBase
             NewTargetHosts = rule.TargetHosts;
             NewTargetPorts = rule.TargetPorts;
             NewProtocol = rule.Protocol;
-            NewProxyAction = rule.Action;
+            SelectedRuleAction = AvailableActions.FirstOrDefault(a =>
+                a.Action == rule.Action && (a.Action != "PROXY" || a.ProxyConfigId == rule.ProxyConfigId))
+                ?? AvailableActions.FirstOrDefault();
             ProcessNameError = "";
             IsAddRuleViewOpen = true;
         });
@@ -616,7 +635,7 @@ public class ProxyRulesViewModel : ViewModelBase
     }
 }
 
-// JSON export/import model matching macOS format
+// same format as macos export
 public class ProxyRuleExport
 {
     public string ProcessNames { get; set; } = "*";
@@ -627,7 +646,20 @@ public class ProxyRuleExport
     public bool Enabled { get; set; } = true;
 }
 
-// JSON serialization context for NativeAOT compatibility
+public class RuleActionItem
+{
+    public string Label { get; }
+    public string Action { get; }   // "PROXY", "DIRECT", "BLOCK"
+    public uint ProxyConfigId { get; }
+
+    public RuleActionItem(string label, string action, uint proxyConfigId)
+    {
+        Label = label;
+        Action = action;
+        ProxyConfigId = proxyConfigId;
+    }
+}
+
 [JsonSourceGenerationOptions(
     WriteIndented = true,
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,

@@ -33,6 +33,7 @@ typedef struct PROCESS_RULE {
     char *target_ports;   // Dynamic: Port filter "*", "80", "80;443", "8000-9000"
     RuleProtocol protocol;  // TCP, UDP, or BOTH
     RuleAction action;
+    UINT32 proxy_config_id;  // Which proxy config to route this rule through (0 = first available)
     BOOL enabled;
     struct PROCESS_RULE *next;
 } PROCESS_RULE;
@@ -50,6 +51,7 @@ typedef struct CONNECTION_INFO {
     UINT16 orig_dest_port;
     BOOL is_tracked;
     ULONGLONG last_activity;  // GetTickCount64() timestamp for cleanup
+    UINT32 proxy_config_id;  // Which proxy config handles this connection
     struct CONNECTION_INFO *next;
 } CONNECTION_INFO;
 
@@ -57,6 +59,7 @@ typedef struct {
     SOCKET client_socket;
     UINT32 orig_dest_ip;
     UINT16 orig_dest_port;
+    UINT32 proxy_config_id;  // Which proxy config to use for this connection
 } CONNECTION_CONFIG;
 
 typedef struct {
@@ -83,6 +86,25 @@ typedef struct PID_CACHE_ENTRY {
     struct PID_CACHE_ENTRY *next;
 } PID_CACHE_ENTRY;
 
+// Internal proxy configuration with per-config UDP SOCKS5 state
+typedef struct {
+    UINT32 config_id;           // Unique ID (1-based), 0 = unused slot
+    ProxyType type;
+    char host[256];             // Hostname or IP
+    UINT16 port;
+    char username[256];
+    char password[256];
+    ULONGLONG last_udp_attempt; // Rate-limit UDP ASSOCIATE retry per config
+    SOCKET udp_tcp_ctrl;        // TCP control socket for SOCKS5 UDP ASSOCIATE
+    SOCKET udp_send_sock;       // UDP socket for sending/receiving via this proxy
+    struct sockaddr_in udp_relay_addr;
+    BOOL udp_connected;
+} PROXY_CONFIG;
+
+static PROXY_CONFIG g_proxy_configs[MAX_PROXY_CONFIGS];
+static int g_proxy_config_count = 0;
+static UINT32 g_next_config_id = 1;
+
 static CONNECTION_INFO *connection_hash_table[CONNECTION_HASH_SIZE] = {NULL};
 static LOGGED_CONNECTION *logged_connections = NULL;
 static PROCESS_RULE *rules_list = NULL;
@@ -96,22 +118,12 @@ static HANDLE cleanup_thread = NULL;
 static PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE] = {NULL};
 static BOOL g_has_active_rules = FALSE;
 static SOCKET udp_relay_socket = INVALID_SOCKET;
-static SOCKET socks5_udp_socket = INVALID_SOCKET;
-static SOCKET socks5_udp_send_socket = INVALID_SOCKET;
-static struct sockaddr_in socks5_udp_relay_addr;
-static BOOL udp_associate_connected = FALSE;
-static DWORD last_udp_connect_attempt = 0;
 static BOOL running = FALSE;
 static DWORD g_current_process_id = 0;
 
 static BOOL g_traffic_logging_enabled = TRUE;
 
-static char g_proxy_host[256] = "";  // Can be IP address or hostname
-static UINT16 g_proxy_port = 0;
 static UINT16 g_local_relay_port = LOCAL_PROXY_PORT;
-static ProxyType g_proxy_type = PROXY_TYPE_SOCKS5;
-static char g_proxy_username[256] = "";
-static char g_proxy_password[256] = "";
 static BOOL g_dns_via_proxy = TRUE;
 static BOOL g_localhost_via_proxy = FALSE;  // default disabled for security - most proxy server block localhost for ssrf and also many app might not work if localhost trafic goes to remote server if proxy server is on diffrent machine
 static LogCallback g_log_callback = NULL;
@@ -213,8 +225,11 @@ static int send_all(SOCKET sock, const char *buf, int len)
 
 static UINT32 parse_ipv4(const char *ip);
 static UINT32 resolve_hostname(const char *hostname);
-static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port);
-static int socks5_udp_associate(SOCKET s, struct sockaddr_in *relay_addr);
+static PROXY_CONFIG* find_proxy_config(UINT32 config_id);
+static BOOL any_socks5_config(void);
+static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
+static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg);
+static BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg);
 static DWORD WINAPI udp_relay_server(LPVOID arg);
 static BOOL match_ip_pattern(const char *pattern, UINT32 ip);
 static BOOL match_port_pattern(const char *pattern, UINT16 port);
@@ -222,7 +237,7 @@ static BOOL match_ip_list(const char *ip_list, UINT32 ip);
 static BOOL match_port_list(const char *port_list, UINT16 port);
 static BOOL match_process_pattern(const char *pattern, const char *process_name);
 static BOOL match_process_list(const char *process_list, const char *process_name);
-static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port);
+static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
 static DWORD WINAPI local_proxy_server(LPVOID arg);
 static DWORD WINAPI connection_handler(LPVOID arg);
 static DWORD WINAPI transfer_handler(LPVOID arg);
@@ -230,10 +245,11 @@ static DWORD WINAPI packet_processor(LPVOID arg);
 static DWORD get_process_id_from_connection(UINT32 src_ip, UINT16 src_port);
 static DWORD get_process_id_from_udp_connection(UINT32 src_ip, UINT16 src_port);
 static BOOL get_process_name_from_pid(DWORD pid, char *name, DWORD name_size);
-static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp);
-static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid);
-static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port);
+static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id);
+static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id);
+static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id);
 static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port);
+static UINT32 get_connection_proxy_id(UINT16 src_port);
 static BOOL is_connection_tracked(UINT16 src_port);
 static void remove_connection(UINT16 src_port);
 static void cleanup_stale_connections(void);
@@ -323,11 +339,12 @@ static DWORD WINAPI packet_processor(LPVOID arg)
 
                     RuleAction action;
                     DWORD pid = 0;
+                    UINT32 proxy_config_id = 0;
 
                     if (dest_port == 53 && !g_dns_via_proxy)
                         action = RULE_ACTION_DIRECT;
                     else
-                        action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid);
+                        action = check_process_rule(src_ip, src_port, dest_ip, dest_port, TRUE, &pid, &proxy_config_id);
 
                     // override PROXY to DIRECT if localhost proxy is disabled and destination is localhost
                     BYTE dest_first_octet = (dest_ip >> 0) & 0xFF;
@@ -359,8 +376,13 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                                 char proxy_info[128];
                                 if (action == RULE_ACTION_PROXY)
                                 {
-                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy SOCKS5://%s:%d (UDP)",
-                                        g_proxy_host, g_proxy_port);
+                                    PROXY_CONFIG *pcfg = find_proxy_config(proxy_config_id);
+                                    if (pcfg != NULL)
+                                        snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d (UDP)",
+                                            pcfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+                                            pcfg->host, pcfg->port);
+                                    else
+                                        snprintf(proxy_info, sizeof(proxy_info), "Proxy (UDP)");
                                 }
                                 else if (action == RULE_ACTION_DIRECT)
                                 {
@@ -389,7 +411,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
 
                     if (action == RULE_ACTION_PROXY)
                     {
-                        add_connection(src_port, src_ip, dest_ip, dest_port);
+                        add_connection(src_port, src_ip, dest_ip, dest_port, proxy_config_id);
 
                         // redirect to UDP relay server at 127.0.0.1:34011
                         udp_header->DstPort = htons(LOCAL_UDP_RELAY_PORT);
@@ -493,11 +515,12 @@ static DWORD WINAPI packet_processor(LPVOID arg)
 
                 RuleAction action;
                 DWORD pid = 0;
+                UINT32 proxy_config_id = 0;
 
                 if (orig_dest_port == 53 && !g_dns_via_proxy)
                     action = RULE_ACTION_DIRECT;
                 else
-                    action = check_process_rule(src_ip, src_port, orig_dest_ip, orig_dest_port, FALSE, &pid);
+                    action = check_process_rule(src_ip, src_port, orig_dest_ip, orig_dest_port, FALSE, &pid, &proxy_config_id);
 
                 BYTE orig_dest_first_octet = (orig_dest_ip >> 0) & 0xFF;
                 if (action == RULE_ACTION_PROXY && !g_localhost_via_proxy && orig_dest_first_octet == 127)
@@ -523,9 +546,13 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                             char proxy_info[128];
                             if (action == RULE_ACTION_PROXY)
                             {
-                                snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d",
-                                    g_proxy_type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
-                                    g_proxy_host, g_proxy_port);
+                                PROXY_CONFIG *pcfg = find_proxy_config(proxy_config_id);
+                                if (pcfg != NULL)
+                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy %s://%s:%d",
+                                        pcfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+                                        pcfg->host, pcfg->port);
+                                else
+                                    snprintf(proxy_info, sizeof(proxy_info), "Proxy");
                             }
                             else if (action == RULE_ACTION_DIRECT)
                             {
@@ -560,7 +587,7 @@ static DWORD WINAPI packet_processor(LPVOID arg)
                 }
                 else if (action == RULE_ACTION_PROXY)
             {
-                add_connection(src_port, src_ip, orig_dest_ip, orig_dest_port);
+                add_connection(src_port, src_ip, orig_dest_ip, orig_dest_port, proxy_config_id);
 
                 tcp_header->DstPort = htons(g_local_relay_port);
 
@@ -1097,7 +1124,7 @@ static BOOL is_broadcast_or_multicast(UINT32 ip)
 
 // Unified rule matching function for both TCP and UDP
 // Matches rules by process name, IP, port, and protocol
-static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp)
+static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, UINT32 *out_proxy_config_id)
 {
     PROCESS_RULE *rule = rules_list;
     PROCESS_RULE *wildcard_rule = NULL;  // Save fully wildcard rule for last
@@ -1142,6 +1169,7 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
                     match_port_list(rule->target_ports, dest_port))
                 {
                     // Matched! Return this rule's action
+                    if (out_proxy_config_id != NULL) *out_proxy_config_id = rule->proxy_config_id;
                     return rule->action;
                 }
                 // Didn't match, continue
@@ -1166,6 +1194,7 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
                 match_port_list(rule->target_ports, dest_port))
             {
                 // All filters matched! Return this rule's action
+                if (out_proxy_config_id != NULL) *out_proxy_config_id = rule->proxy_config_id;
                 return rule->action;
             }
         }
@@ -1176,14 +1205,16 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
     // No specific rule matched, use wildcard if available
     if (wildcard_rule != NULL)
     {
+        if (out_proxy_config_id != NULL) *out_proxy_config_id = wildcard_rule->proxy_config_id;
         return wildcard_rule->action;
     }
 
     // No rule matched at all
+    if (out_proxy_config_id != NULL) *out_proxy_config_id = 0;
     return RULE_ACTION_DIRECT;
 }
 
-static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid)
+static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id)
 {
     DWORD pid;
     char process_name[MAX_PROCESS_NAME];
@@ -1207,27 +1238,60 @@ static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest
         return RULE_ACTION_DIRECT;
 
     // Use unified rule matching function
-    RuleAction action = match_rule(process_name, dest_ip, dest_port, is_udp);
+    UINT32 proxy_config_id = 0;
+    RuleAction action = match_rule(process_name, dest_ip, dest_port, is_udp, &proxy_config_id);
 
     // Additional checks for proxy configuration
-    if (action == RULE_ACTION_PROXY && is_udp && g_proxy_type == PROXY_TYPE_HTTP)
+    if (action == RULE_ACTION_PROXY)
     {
-        return RULE_ACTION_DIRECT;  // HTTP proxy doesn't support UDP
+        PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
+        if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
+            return RULE_ACTION_DIRECT;  // No proxy configured
+
+        // UDP: HTTP proxy doesn't support UDP - use per-rule proxy config type
+        if (is_udp && cfg->type == PROXY_TYPE_HTTP)
+            return RULE_ACTION_DIRECT;
     }
-    if (action == RULE_ACTION_PROXY && (g_proxy_host[0] == '\0' || g_proxy_port == 0))
-    {
-        return RULE_ACTION_DIRECT;  // No proxy configured
-    }
+
+    if (out_proxy_config_id != NULL)
+        *out_proxy_config_id = proxy_config_id;
 
     return action;
 }
 
 
-static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
+// Helper: find proxy config by ID; falls back to first config if not found
+static PROXY_CONFIG* find_proxy_config(UINT32 config_id)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].config_id == config_id)
+            return &g_proxy_configs[i];
+    }
+    // Fall back to first available config
+    if (g_proxy_config_count > 0)
+        return &g_proxy_configs[0];
+    return NULL;
+}
+
+// Helper: check if any proxy config is SOCKS5 (needed to decide whether to start UDP relay)
+static BOOL any_socks5_config(void)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].type == PROXY_TYPE_SOCKS5 &&
+            g_proxy_configs[i].host[0] != '\0' &&
+            g_proxy_configs[i].port != 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg)
 {
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
-    BOOL use_auth = (g_proxy_username[0] != '\0');
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
 
     buf[0] = SOCKS5_VERSION;
     if (use_auth)
@@ -1269,8 +1333,8 @@ static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
         }
 
         // Send username/password (RFC 1929)
-        size_t user_len = strlen(g_proxy_username);
-        size_t pass_len = strlen(g_proxy_password);
+        size_t user_len = strlen(cfg->username);
+        size_t pass_len = strlen(cfg->password);
         if (user_len > 255 || pass_len > 255)
         {
             log_message("SOCKS5: Username or password too long");
@@ -1279,9 +1343,9 @@ static int socks5_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
 
         buf[0] = 0x01;  // Version of username/password auth
         buf[1] = (unsigned char)user_len;
-        memcpy(&buf[2], g_proxy_username, user_len);
+        memcpy(&buf[2], cfg->username, user_len);
         buf[2 + user_len] = (unsigned char)pass_len;
-        memcpy(&buf[3 + user_len], g_proxy_password, pass_len);
+        memcpy(&buf[3 + user_len], cfg->password, pass_len);
 
         if (send(s, (char*)buf, 3 + user_len + pass_len, 0) != (int)(3 + user_len + pass_len))
         {
@@ -1352,21 +1416,21 @@ static void base64_encode(const char* input, char* output, size_t output_size)
     output[output_len] = '\0';
 }
 
-static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
+static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg)
 {
     char request[HTTP_BUFFER_SIZE];
     char response[4096];
     int len;
     char *status_line;
     int status_code;
-    BOOL use_auth = (g_proxy_username[0] != '\0');
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
 
     if (use_auth)
     {
         // Create "username:password" string and encode as Base64
         char credentials[SOCKS5_BUFFER_SIZE];
         char encoded[HTTP_BUFFER_SIZE];
-        snprintf(credentials, sizeof(credentials), "%s:%s", g_proxy_username, g_proxy_password);
+        snprintf(credentials, sizeof(credentials), "%s:%s", cfg->username, cfg->password);
         base64_encode(credentials, encoded, sizeof(encoded));
 
         char ip_str[32];
@@ -1426,11 +1490,11 @@ static int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port)
     return 0;
 }
 
-static int socks5_udp_associate(SOCKET s, struct sockaddr_in *relay_addr)
+static int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg)
 {
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
-    BOOL use_auth = (g_proxy_username[0] != '\0');
+    BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
 
     buf[0] = SOCKS5_VERSION;
     if (use_auth)
@@ -1458,16 +1522,16 @@ static int socks5_udp_associate(SOCKET s, struct sockaddr_in *relay_addr)
         if (!use_auth)
             return -1;
 
-        size_t user_len = strlen(g_proxy_username);
-        size_t pass_len = strlen(g_proxy_password);
+        size_t user_len = strlen(cfg->username);
+        size_t pass_len = strlen(cfg->password);
         if (user_len > 255 || pass_len > 255)
             return -1;
 
         buf[0] = 0x01;
         buf[1] = (unsigned char)user_len;
-        memcpy(&buf[2], g_proxy_username, user_len);
+        memcpy(&buf[2], cfg->username, user_len);
         buf[2 + user_len] = (unsigned char)pass_len;
-        memcpy(&buf[3 + user_len], g_proxy_password, pass_len);
+        memcpy(&buf[3 + user_len], cfg->password, pass_len);
 
         if (send(s, (char*)buf, 3 + user_len + pass_len, 0) != (int)(3 + user_len + pass_len))
             return -1;
@@ -1506,27 +1570,31 @@ static int socks5_udp_associate(SOCKET s, struct sockaddr_in *relay_addr)
     return 0;
 }
 
-// connect UDP ASSOCIATE with SOCKS5 proxy
-// Need to monitor the System memory and CPU usage
-static BOOL establish_udp_associate(void)
+// connect UDP ASSOCIATE with SOCKS5 proxy (per proxy config)
+static BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg)
 {
-    // Prevent retry spam - only try every 5 seconds
-    ULONGLONG now = GetTickCount64();
-    if (now - last_udp_connect_attempt < 5000)
+    if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
+        return FALSE;
+    if (cfg->type != PROXY_TYPE_SOCKS5)
         return FALSE;
 
-    last_udp_connect_attempt = now;
+    // Prevent retry spam - only try every 5 seconds per config
+    ULONGLONG now = GetTickCount64();
+    if (now - cfg->last_udp_attempt < 5000)
+        return FALSE;
+
+    cfg->last_udp_attempt = now;
 
     // Close existing connections if any
-    if (socks5_udp_socket != INVALID_SOCKET)
+    if (cfg->udp_tcp_ctrl != INVALID_SOCKET)
     {
-        closesocket(socks5_udp_socket);
-        socks5_udp_socket = INVALID_SOCKET;
+        closesocket(cfg->udp_tcp_ctrl);
+        cfg->udp_tcp_ctrl = INVALID_SOCKET;
     }
-    if (socks5_udp_send_socket != INVALID_SOCKET)
+    if (cfg->udp_send_sock != INVALID_SOCKET)
     {
-        closesocket(socks5_udp_send_socket);
-        socks5_udp_send_socket = INVALID_SOCKET;
+        closesocket(cfg->udp_send_sock);
+        cfg->udp_send_sock = INVALID_SOCKET;
     }
 
     // Create TCP control connection
@@ -1536,7 +1604,7 @@ static BOOL establish_udp_associate(void)
 
     configure_tcp_socket(tcp_sock, 262144, 3000);
 
-    UINT32 socks5_ip = resolve_hostname(g_proxy_host);
+    UINT32 socks5_ip = resolve_hostname(cfg->host);
     if (socks5_ip == 0)
     {
         closesocket(tcp_sock);
@@ -1547,7 +1615,7 @@ static BOOL establish_udp_associate(void)
     memset(&socks_addr, 0, sizeof(socks_addr));
     socks_addr.sin_family = AF_INET;
     socks_addr.sin_addr.s_addr = socks5_ip;
-    socks_addr.sin_port = htons(g_proxy_port);
+    socks_addr.sin_port = htons(cfg->port);
 
     if (connect(tcp_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
     {
@@ -1555,27 +1623,28 @@ static BOOL establish_udp_associate(void)
         return FALSE;
     }
 
-    if (socks5_udp_associate(tcp_sock, &socks5_udp_relay_addr) != 0)
+    if (socks5_udp_associate_with_config(tcp_sock, &cfg->udp_relay_addr, cfg) != 0)
     {
         closesocket(tcp_sock);
         return FALSE;
     }
 
-    socks5_udp_socket = tcp_sock;
+    cfg->udp_tcp_ctrl = tcp_sock;
 
-    // ccreate UDP socket for sending to SOCKS5 proxy
-    socks5_udp_send_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (socks5_udp_send_socket == INVALID_SOCKET)
+    // create UDP socket for sending to SOCKS5 proxy
+    cfg->udp_send_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (cfg->udp_send_sock == INVALID_SOCKET)
     {
-        closesocket(socks5_udp_socket);
-        socks5_udp_socket = INVALID_SOCKET;
+        closesocket(cfg->udp_tcp_ctrl);
+        cfg->udp_tcp_ctrl = INVALID_SOCKET;
+        cfg->udp_connected = FALSE;
         return FALSE;
     }
 
-    configure_udp_socket(socks5_udp_send_socket, 262144, 30000);
+    configure_udp_socket(cfg->udp_send_sock, 262144, 30000);
 
-    udp_associate_connected = TRUE;
-    log_message("UDP ASSOCIATE established with SOCKS5 proxy");
+    cfg->udp_connected = TRUE;
+    log_message("UDP ASSOCIATE established with SOCKS5 proxy %s:%d", cfg->host, cfg->port);
     return TRUE;
 }
 
@@ -1614,14 +1683,16 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
         return 1;
     }
 
-    // Try initial UDP ASSOCIATE (non-fatal if it fails)
-    udp_associate_connected = establish_udp_associate();
+    // Try initial UDP ASSOCIATE for all SOCKS5 configs
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        if (g_proxy_configs[i].type == PROXY_TYPE_SOCKS5)
+        {
+            establish_udp_associate_for_config(&g_proxy_configs[i]);
+        }
+    }
 
     log_message("UDP relay listening on port %d", LOCAL_UDP_RELAY_PORT);
-    if (!udp_associate_connected)
-    {
-        log_message("UDP ASSOCIATE not available yet - will retry when needed");
-    }
 
     while (running)
     {
@@ -1629,44 +1700,42 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
         FD_ZERO(&read_fds);
         FD_SET(udp_relay_socket, &read_fds);
 
-        // monitor both TCP control connection and UDP send socket
-        if (udp_associate_connected && socks5_udp_socket != INVALID_SOCKET)
-            FD_SET(socks5_udp_socket, &read_fds);
-
-        if (udp_associate_connected && socks5_udp_send_socket != INVALID_SOCKET)
-            FD_SET(socks5_udp_send_socket, &read_fds);
+        // Add all SOCKS5 configs' TCP control and UDP send sockets
+        for (int i = 0; i < g_proxy_config_count; i++)
+        {
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->type != PROXY_TYPE_SOCKS5) continue;
+            if (cfg->udp_connected && cfg->udp_tcp_ctrl != INVALID_SOCKET)
+                FD_SET(cfg->udp_tcp_ctrl, &read_fds);
+            if (cfg->udp_connected && cfg->udp_send_sock != INVALID_SOCKET)
+                FD_SET(cfg->udp_send_sock, &read_fds);
+        }
 
         struct timeval timeout = {1, 0};
-
-        SOCKET max_fd = udp_relay_socket;
-        if (socks5_udp_socket > max_fd) max_fd = socks5_udp_socket;
-        if (socks5_udp_send_socket > max_fd) max_fd = socks5_udp_send_socket;
-
-        if (select(max_fd + 1, &read_fds, NULL, NULL, &timeout) <= 0)
+        if (select(0, &read_fds, NULL, NULL, &timeout) <= 0)
             continue;
 
-        // check SOCKS5 server disconnected
-        if (udp_associate_connected && socks5_udp_socket != INVALID_SOCKET && FD_ISSET(socks5_udp_socket, &read_fds))
+        // Check if any SOCKS5 proxy TCP control socket disconnected
+        for (int i = 0; i < g_proxy_config_count; i++)
         {
-            char test_buf[1];
-            int result = recv(socks5_udp_socket, test_buf, sizeof(test_buf), MSG_PEEK);
-            if (result == 0 || (result == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK))
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->type != PROXY_TYPE_SOCKS5 || !cfg->udp_connected) continue;
+            if (cfg->udp_tcp_ctrl != INVALID_SOCKET && FD_ISSET(cfg->udp_tcp_ctrl, &read_fds))
             {
-                log_message("[UDP RELAY] TCP control connection closed - SOCKS5 proxy disconnected");
-
-                // close all connections
-                if (socks5_udp_socket != INVALID_SOCKET)
+                char test_buf[1];
+                int result = recv(cfg->udp_tcp_ctrl, test_buf, sizeof(test_buf), MSG_PEEK);
+                if (result == 0 || (result == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK))
                 {
-                    closesocket(socks5_udp_socket);
-                    socks5_udp_socket = INVALID_SOCKET;
+                    log_message("[UDP RELAY] TCP control connection closed for proxy %s:%d", cfg->host, cfg->port);
+                    closesocket(cfg->udp_tcp_ctrl);
+                    cfg->udp_tcp_ctrl = INVALID_SOCKET;
+                    if (cfg->udp_send_sock != INVALID_SOCKET)
+                    {
+                        closesocket(cfg->udp_send_sock);
+                        cfg->udp_send_sock = INVALID_SOCKET;
+                    }
+                    cfg->udp_connected = FALSE;
                 }
-                if (socks5_udp_send_socket != INVALID_SOCKET)
-                {
-                    closesocket(socks5_udp_send_socket);
-                    socks5_udp_send_socket = INVALID_SOCKET;
-                }
-                udp_associate_connected = FALSE;
-                continue;
             }
         }
 
@@ -1679,23 +1748,31 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
 
             if (recv_len > 0)
             {
-            // Buffer overflow protection
-            if (recv_len > MAXBUF - 10) continue;
+                // Buffer overflow protection
+                if (recv_len > MAXBUF - 10) continue;
 
-                UINT32 from_ip = from_addr.sin_addr.s_addr;
                 UINT16 from_port = ntohs(from_addr.sin_port);
                 UINT32 dest_ip;
                 UINT16 dest_port;
+
                 if (get_connection(from_port, &dest_ip, &dest_port))
                 {
+                    // Get the proxy config for this connection
+                    UINT32 proxy_config_id = get_connection_proxy_id(from_port);
+                    PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
+
+                    if (cfg == NULL || cfg->type != PROXY_TYPE_SOCKS5)
+                    {
+                        log_message("[UDP RELAY] No SOCKS5 config for port %d", from_port);
+                        continue;
+                    }
 
                     // Ensure UDP ASSOCIATE is established (retry if needed)
-                    if (!udp_associate_connected)
+                    if (!cfg->udp_connected)
                     {
-                        udp_associate_connected = establish_udp_associate();
-                        if (!udp_associate_connected)
+                        if (!establish_udp_associate_for_config(cfg))
                         {
-                            log_message("[UDP RELAY] Cannot send - UDP ASSOCIATE not established");
+                            log_message("[UDP RELAY] Cannot send - UDP ASSOCIATE not established for %s:%d", cfg->host, cfg->port);
                             continue;
                         }
                     }
@@ -1712,25 +1789,15 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
                     send_buf[9] = (dest_port >> 0) & 0xFF;
                     memcpy(&send_buf[10], recv_buf, recv_len);
 
-                    int sent = sendto(socks5_udp_send_socket, (char*)send_buf, 10 + recv_len, 0,
-                          (struct sockaddr *)&socks5_udp_relay_addr, sizeof(socks5_udp_relay_addr));
+                    int sent = sendto(cfg->udp_send_sock, (char*)send_buf, 10 + recv_len, 0,
+                          (struct sockaddr *)&cfg->udp_relay_addr, sizeof(cfg->udp_relay_addr));
 
                     if (sent == SOCKET_ERROR) {
                         int err = WSAGetLastError();
-                        log_message("[UDP RELAY ERROR] Failed to send to SOCKS5 proxy: %d - closing connection", err);
-
-                        // connection is broken close all sockets and retry
-                        if (socks5_udp_socket != INVALID_SOCKET)
-                        {
-                            closesocket(socks5_udp_socket);
-                            socks5_udp_socket = INVALID_SOCKET;
-                        }
-                        if (socks5_udp_send_socket != INVALID_SOCKET)
-                        {
-                            closesocket(socks5_udp_send_socket);
-                            socks5_udp_send_socket = INVALID_SOCKET;
-                        }
-                        udp_associate_connected = FALSE;
+                        log_message("[UDP RELAY ERROR] Failed to send to SOCKS5 proxy %s:%d: %d - closing", cfg->host, cfg->port, err);
+                        if (cfg->udp_tcp_ctrl != INVALID_SOCKET) { closesocket(cfg->udp_tcp_ctrl); cfg->udp_tcp_ctrl = INVALID_SOCKET; }
+                        if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+                        cfg->udp_connected = FALSE;
                     }
                 }
                 else
@@ -1740,60 +1807,51 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
             }
         }
 
-        // Check if packet is from SOCKS5 proxy (only if connected)
-        if (udp_associate_connected && socks5_udp_send_socket != INVALID_SOCKET && FD_ISSET(socks5_udp_send_socket, &read_fds))
+        // Check if packet is from any SOCKS5 proxy's UDP socket
+        for (int i = 0; i < g_proxy_config_count; i++)
         {
+            PROXY_CONFIG *cfg = &g_proxy_configs[i];
+            if (cfg->type != PROXY_TYPE_SOCKS5 || !cfg->udp_connected) continue;
+            if (cfg->udp_send_sock == INVALID_SOCKET || !FD_ISSET(cfg->udp_send_sock, &read_fds)) continue;
+
             from_len = sizeof(from_addr);
-            recv_len = recvfrom(socks5_udp_send_socket, (char*)recv_buf, sizeof(recv_buf), 0,
+            recv_len = recvfrom(cfg->udp_send_sock, (char*)recv_buf, sizeof(recv_buf), 0,
                                (struct sockaddr *)&from_addr, &from_len);
 
             if (recv_len == SOCKET_ERROR)
             {
                 int err = WSAGetLastError();
-                log_message("[UDP RELAY ERROR] Failed to receive from SOCKS5 proxy: %d - closing connection", err);
-                if (socks5_udp_socket != INVALID_SOCKET)
-                {
-                    closesocket(socks5_udp_socket);
-                    socks5_udp_socket = INVALID_SOCKET;
-                }
-                if (socks5_udp_send_socket != INVALID_SOCKET)
-                {
-                    closesocket(socks5_udp_send_socket);
-                    socks5_udp_send_socket = INVALID_SOCKET;
-                }
-                udp_associate_connected = FALSE;
+                log_message("[UDP RELAY ERROR] Failed to receive from proxy %s:%d: %d - closing", cfg->host, cfg->port, err);
+                if (cfg->udp_tcp_ctrl != INVALID_SOCKET) { closesocket(cfg->udp_tcp_ctrl); cfg->udp_tcp_ctrl = INVALID_SOCKET; }
+                closesocket(cfg->udp_send_sock);
+                cfg->udp_send_sock = INVALID_SOCKET;
+                cfg->udp_connected = FALSE;
                 continue;
             }
 
             if (recv_len > 0)
             {
                 // Packet from SOCKS5 proxy - decapsulate and forward to original sender
-                if (recv_len < 10)
-                    continue;
+                if (recv_len < 10) continue;
 
                 // SOCKS5 UDP packet format: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR(4) + DST.PORT(2) + DATA
-                if (recv_buf[2] != 0x00)  // FRAG must be 0
-                    continue;
+                if (recv_buf[2] != 0x00) continue;  // FRAG must be 0
+                if (recv_buf[3] != SOCKS5_ATYP_IPV4) continue;  // Only IPv4 supported
 
-                if (recv_buf[3] != SOCKS5_ATYP_IPV4)  // Only IPv4 supported
-                    continue;
-
-                // Extract source IP and port from SOCKS5 header
                 UINT32 src_ip = (recv_buf[4] << 0) | (recv_buf[5] << 8) |
                                (recv_buf[6] << 16) | (recv_buf[7] << 24);
                 UINT16 src_port = (recv_buf[8] << 8) | recv_buf[9];
 
-                // Find which local port this packet should go to
+                // Find which local port to deliver to via reverse lookup
                 WaitForSingleObject(lock, INFINITE);
                 struct sockaddr_in target_addr;
                 BOOL found = FALSE;
                 UINT32 target_ip = 0;
                 UINT16 target_port = 0;
 
-                // search all hash for reverse lookup in bucket
-                for (int i = 0; i < CONNECTION_HASH_SIZE && !found; i++)
+                for (int b = 0; b < CONNECTION_HASH_SIZE && !found; b++)
                 {
-                    CONNECTION_INFO *conn = connection_hash_table[i];
+                    CONNECTION_INFO *conn = connection_hash_table[b];
                     while (conn != NULL)
                     {
                         if (conn->orig_dest_ip == src_ip && conn->orig_dest_port == src_port)
@@ -1822,12 +1880,16 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
         }
     }
 
-    closesocket(socks5_udp_socket);
-    closesocket(socks5_udp_send_socket);
+    // Clean up all proxy UDP sockets
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        if (cfg->udp_tcp_ctrl != INVALID_SOCKET) { closesocket(cfg->udp_tcp_ctrl); cfg->udp_tcp_ctrl = INVALID_SOCKET; }
+        if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+        cfg->udp_connected = FALSE;
+    }
     closesocket(udp_relay_socket);
     udp_relay_socket = INVALID_SOCKET;
-    socks5_udp_socket = INVALID_SOCKET;
-    socks5_udp_send_socket = INVALID_SOCKET;
     WSACleanup();
     return 0;
 }
@@ -1916,6 +1978,7 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
             free(conn_config);
             continue;
         }
+        conn_config->proxy_config_id = get_connection_proxy_id(client_port);
 
         HANDLE conn_thread = CreateThread(NULL, 1, connection_handler,
                                           (LPVOID)conn_config, 0, NULL);
@@ -1941,15 +2004,25 @@ static DWORD WINAPI connection_handler(LPVOID arg)
     SOCKET client_sock = config->client_socket;
     UINT32 dest_ip = config->orig_dest_ip;
     UINT16 dest_port = config->orig_dest_port;
+    UINT32 proxy_config_id = config->proxy_config_id;
     SOCKET socks_sock;
     struct sockaddr_in socks_addr;
-    UINT32 socks5_ip;
+    UINT32 proxy_ip;
 
     free(config);
 
-    // Connect to SOCKS5 proxy
-    socks5_ip = resolve_hostname(g_proxy_host);
-    if (socks5_ip == 0)
+    // Look up the proxy config for this connection
+    PROXY_CONFIG *proxy = find_proxy_config(proxy_config_id);
+    if (proxy == NULL || proxy->host[0] == '\0' || proxy->port == 0)
+    {
+        log_message("[RELAY] No proxy config (id=%u) - dropping connection", proxy_config_id);
+        closesocket(client_sock);
+        return 1;
+    }
+
+    // Connect to proxy
+    proxy_ip = resolve_hostname(proxy->host);
+    if (proxy_ip == 0)
     {
         closesocket(client_sock);
         return 1;
@@ -1968,29 +2041,29 @@ static DWORD WINAPI connection_handler(LPVOID arg)
 
     memset(&socks_addr, 0, sizeof(socks_addr));
     socks_addr.sin_family = AF_INET;
-    socks_addr.sin_addr.s_addr = socks5_ip;
-    socks_addr.sin_port = htons(g_proxy_port);
+    socks_addr.sin_addr.s_addr = proxy_ip;
+    socks_addr.sin_port = htons(proxy->port);
 
     if (connect(socks_sock, (struct sockaddr *)&socks_addr, sizeof(socks_addr)) == SOCKET_ERROR)
     {
-        log_message("[RELAY] Failed to connect to proxy (%d)", WSAGetLastError());
+        log_message("[RELAY] Failed to connect to proxy %s:%d (%d)", proxy->host, proxy->port, WSAGetLastError());
         closesocket(client_sock);
         closesocket(socks_sock);
         return 0;
     }
 
-    if (g_proxy_type == PROXY_TYPE_SOCKS5)
+    if (proxy->type == PROXY_TYPE_SOCKS5)
     {
-        if (socks5_connect(socks_sock, dest_ip, dest_port) != 0)
+        if (socks5_connect(socks_sock, dest_ip, dest_port, proxy) != 0)
         {
             closesocket(client_sock);
             closesocket(socks_sock);
             return 0;
         }
     }
-    else if (g_proxy_type == PROXY_TYPE_HTTP)
+    else if (proxy->type == PROXY_TYPE_HTTP)
     {
-        if (http_connect(socks_sock, dest_ip, dest_port) != 0)
+        if (http_connect(socks_sock, dest_ip, dest_port, proxy) != 0)
         {
             closesocket(client_sock);
             closesocket(socks_sock);
@@ -1999,7 +2072,7 @@ static DWORD WINAPI connection_handler(LPVOID arg)
     }
 
     //
-    // educes thread count by 50% and CPU usage significantly
+    // Reduces thread count by 50% and CPU usage significantly
     TRANSFER_CONFIG *transfer_config = (TRANSFER_CONFIG *)malloc(sizeof(TRANSFER_CONFIG));
 
     if (transfer_config == NULL)
@@ -2091,7 +2164,7 @@ cleanup:
     return 0;
 }
 
-static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port)
+static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id)
 {
     WaitForSingleObject(lock, INFINITE);
 
@@ -2105,6 +2178,7 @@ static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT1
             existing->src_ip = src_ip;
             existing->orig_dest_ip = dest_ip;
             existing->orig_dest_port = dest_port;
+            existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
             ReleaseMutex(lock);
             return;
@@ -2122,6 +2196,7 @@ static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT1
     conn->src_ip = src_ip;
     conn->orig_dest_ip = dest_ip;
     conn->orig_dest_port = dest_port;
+    conn->proxy_config_id = proxy_config_id;
     conn->is_tracked = TRUE;
     conn->last_activity = GetTickCount64();
 
@@ -2176,6 +2251,29 @@ static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port)
     ReleaseMutex(lock);
 
     return found;
+}
+
+static UINT32 get_connection_proxy_id(UINT16 src_port)
+{
+    UINT32 proxy_config_id = 0;
+
+    WaitForSingleObject(lock, INFINITE);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port)
+        {
+            proxy_config_id = conn->proxy_config_id;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseMutex(lock);
+
+    return proxy_config_id;
 }
 
 static void remove_connection(UINT16 src_port)
@@ -2290,7 +2388,7 @@ static void cleanup_stale_connections(void)
     ReleaseMutex(lock);
 }
 
-PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action)
+PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_config_id)
 {
     if (process_name == NULL || process_name[0] == '\0')
         return 0;
@@ -2302,6 +2400,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char*
     rule->rule_id = g_next_rule_id++;
     strncpy_s(rule->process_name, MAX_PROCESS_NAME, process_name, _TRUNCATE);
     rule->protocol = protocol;
+    rule->proxy_config_id = proxy_config_id;
 
     if (target_hosts != NULL && target_hosts[0] != '\0')
     {
@@ -2358,7 +2457,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char*
     rules_list = rule;
 
     update_has_active_rules();
-    log_message("Added rule ID: %u for process '%s' (Protocol: %d, Action: %d)", rule->rule_id, process_name, protocol, action);
+    log_message("Added rule ID: %u for process '%s' (Protocol: %d, Action: %d, ProxyConfigId: %u)", rule->rule_id, process_name, protocol, action, proxy_config_id);
 
     return rule->rule_id;
 }
@@ -2436,7 +2535,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_DeleteRule(UINT32 rule_id)
     return FALSE;
 }
 
-PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action)
+PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_config_id)
 {
     if (rule_id == 0 || process_name == NULL || target_hosts == NULL || target_ports == NULL)
         return FALSE;
@@ -2468,9 +2567,10 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditRule(UINT32 rule_id, const char* process_na
 
             rule->protocol = protocol;
             rule->action = action;
+            rule->proxy_config_id = proxy_config_id;
 
             update_has_active_rules();
-            log_message("Updated rule ID: %u", rule_id);
+            log_message("Updated rule ID: %u (ProxyConfigId: %u)", rule_id, proxy_config_id);
             return TRUE;
         }
         rule = rule->next;
@@ -2564,39 +2664,164 @@ PROXYBRIDGE_API BOOL ProxyBridge_MoveRuleToPosition(UINT32 rule_id, UINT32 new_p
     return TRUE;
 }
 
-PROXYBRIDGE_API BOOL ProxyBridge_SetProxyConfig(ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password)
+PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password)
+{
+    if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
+        return 0;
+
+    if (resolve_hostname(proxy_ip) == 0)
+        return 0;
+
+    if (g_proxy_config_count >= MAX_PROXY_CONFIGS)
+        return 0;
+
+    PROXY_CONFIG *cfg = &g_proxy_configs[g_proxy_config_count];
+    memset(cfg, 0, sizeof(PROXY_CONFIG));
+
+    cfg->config_id = g_next_config_id++;
+    cfg->type      = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
+    cfg->port      = proxy_port;
+    strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
+    if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
+    if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
+    cfg->udp_tcp_ctrl  = INVALID_SOCKET;
+    cfg->udp_send_sock = INVALID_SOCKET;
+    cfg->udp_connected = FALSE;
+
+    g_proxy_config_count++;
+    log_message("Added proxy config ID %u: %s:%u (type %d)", cfg->config_id, cfg->host, cfg->port, cfg->type);
+    return cfg->config_id;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType type, const char* proxy_ip, UINT16 proxy_port, const char* username, const char* password)
 {
     if (proxy_ip == NULL || proxy_ip[0] == '\0' || proxy_port == 0)
         return FALSE;
 
-    // Validate that the hostname/IP can be resolved
     if (resolve_hostname(proxy_ip) == 0)
         return FALSE;
 
-    strncpy_s(g_proxy_host, sizeof(g_proxy_host), proxy_ip, _TRUNCATE);
-    g_proxy_port = proxy_port;
-    g_proxy_type = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
-
-    // Store credentials if there
-    if (username != NULL && username[0] != '\0')
+    for (int i = 0; i < g_proxy_config_count; i++)
     {
-        strncpy_s(g_proxy_username, sizeof(g_proxy_username), username, _TRUNCATE);
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        if (cfg->config_id == config_id)
+        {
+            // Close any open UDP state before changing config
+            if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  cfg->udp_tcp_ctrl  = INVALID_SOCKET; }
+            if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+            cfg->udp_connected = FALSE;
+
+            cfg->type = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
+            cfg->port = proxy_port;
+            strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
+            cfg->username[0] = '\0';
+            cfg->password[0] = '\0';
+            if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
+            if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
+
+            log_message("Edited proxy config ID %u: %s:%u (type %d)", config_id, cfg->host, cfg->port, cfg->type);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+PROXYBRIDGE_API BOOL ProxyBridge_DeleteProxyConfig(UINT32 config_id)
+{
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        if (cfg->config_id == config_id)
+        {
+            if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  }
+            if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); }
+
+            // Shift remaining entries down
+            int remaining = g_proxy_config_count - i - 1;
+            if (remaining > 0)
+                memmove(&g_proxy_configs[i], &g_proxy_configs[i + 1], remaining * sizeof(PROXY_CONFIG));
+
+            g_proxy_config_count--;
+            log_message("Deleted proxy config ID %u", config_id);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+PROXYBRIDGE_API int ProxyBridge_TestProxyConfig(UINT32 config_id, const char* target_host, UINT16 target_port, char* result_buffer, size_t buffer_size)
+{
+    PROXY_CONFIG *cfg = find_proxy_config(config_id);
+    if (cfg == NULL)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "No proxy config found", _TRUNCATE);
+        return -1;
+    }
+
+    UINT32 dest_ip = resolve_hostname(target_host);
+    if (dest_ip == 0)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to resolve target host", _TRUNCATE);
+        return -1;
+    }
+
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to create socket", _TRUNCATE);
+        return -1;
+    }
+
+    // Set timeout
+    DWORD timeout = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
+
+    struct sockaddr_in proxy_addr;
+    memset(&proxy_addr, 0, sizeof(proxy_addr));
+    proxy_addr.sin_family = AF_INET;
+    proxy_addr.sin_port   = htons(cfg->port);
+    UINT32 proxy_ip = resolve_hostname(cfg->host);
+    if (proxy_ip == 0)
+    {
+        closesocket(sock);
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to resolve proxy host", _TRUNCATE);
+        return -1;
+    }
+    proxy_addr.sin_addr.s_addr = proxy_ip;
+
+    if (connect(sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) != 0)
+    {
+        closesocket(sock);
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Failed to connect to proxy", _TRUNCATE);
+        return -1;
+    }
+
+    int result;
+    if (cfg->type == PROXY_TYPE_SOCKS5)
+        result = socks5_connect(sock, dest_ip, target_port, cfg);
+    else
+        result = http_connect(sock, dest_ip, target_port, cfg);
+
+    closesocket(sock);
+
+    if (result == 0)
+    {
+        if (result_buffer && buffer_size > 0)
+            strncpy_s(result_buffer, buffer_size, "Connection successful", _TRUNCATE);
+        return 0;
     }
     else
     {
-        g_proxy_username[0] = '\0';
+        if (result_buffer && buffer_size > 0)
+            snprintf(result_buffer, buffer_size, "Connection failed (code %d)", result);
+        return result;
     }
-
-    if (password != NULL && password[0] != '\0')
-    {
-        strncpy_s(g_proxy_password, sizeof(g_proxy_password), password, _TRUNCATE);
-    }
-    else
-    {
-        g_proxy_password[0] = '\0';
-    }
-
-    return TRUE;
 }
 
 PROXYBRIDGE_API void ProxyBridge_SetDnsViaProxy(BOOL enable)
@@ -2890,7 +3115,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
         return FALSE;
     }
 
-    if (g_proxy_type == PROXY_TYPE_SOCKS5)
+    if (any_socks5_config())
     {
         udp_relay_thread = CreateThread(NULL, 1, udp_relay_server, NULL, 0, NULL);
         if (udp_relay_thread == NULL)
@@ -2956,7 +3181,16 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
 
     log_message("ProxyBridge started");
     log_message("Local relay: localhost:%d", g_local_relay_port);
-    log_message("%s proxy: %s:%d", g_proxy_type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5", g_proxy_host, g_proxy_port);
+    for (int i = 0; i < g_proxy_config_count; i++)
+    {
+        PROXY_CONFIG *cfg = &g_proxy_configs[i];
+        log_message("Proxy config ID %u: %s %s:%u",
+            cfg->config_id,
+            cfg->type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
+            cfg->host, cfg->port);
+    }
+    if (g_proxy_config_count == 0)
+        log_message("Warning: No proxy configs configured");
 
     int rule_count = 0;
     PROCESS_RULE *rule = rules_list;
@@ -3045,197 +3279,6 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
 }
 
 
-PROXYBRIDGE_API int ProxyBridge_TestConnection(const char* target_host, UINT16 target_port, char* result_buffer, size_t buffer_size)
-{
-    WSADATA wsa;
-    SOCKET test_sock = INVALID_SOCKET;
-    struct sockaddr_in proxy_addr;
-    struct hostent* host_info;
-    UINT32 target_ip;
-    int ret = -1;
-    char temp_buffer[FILTER_BUFFER_SIZE];
-
-    if (g_proxy_host[0] == '\0' || g_proxy_port == 0)
-    {
-        snprintf(result_buffer, buffer_size, "ERROR: No proxy configured");
-        return -1;
-    }
-
-    if (target_host == NULL || target_host[0] == '\0')
-    {
-        snprintf(result_buffer, buffer_size, "ERROR: Invalid target host");
-        return -1;
-    }
-
-    // Initialize Winsock
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-    {
-        snprintf(result_buffer, buffer_size, "ERROR: WSAStartup failed (%d)", WSAGetLastError());
-        return -1;
-    }
-
-    snprintf(temp_buffer, sizeof(temp_buffer), "Testing connection to %s:%d via %s proxy %s:%d...\n",
-        target_host, target_port,
-        g_proxy_type == PROXY_TYPE_HTTP ? "HTTP" : "SOCKS5",
-        g_proxy_host, g_proxy_port);
-    strncpy_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-
-
-    host_info = gethostbyname(target_host);
-    if (host_info == NULL)
-    {
-        snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Failed to resolve hostname %s (%d)\n", target_host, WSAGetLastError());
-        strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-        WSACleanup();
-        return -1;
-    }
-    target_ip = *(UINT32*)host_info->h_addr_list[0];
-
-    snprintf(temp_buffer, sizeof(temp_buffer), "Resolved %s to %d.%d.%d.%d\n",
-        target_host,
-        (target_ip >> 0) & 0xFF, (target_ip >> 8) & 0xFF,
-        (target_ip >> 16) & 0xFF, (target_ip >> 24) & 0xFF);
-    strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-
-    // Create socket
-    test_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (test_sock == INVALID_SOCKET)
-    {
-        snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Socket creation failed (%d)\n", WSAGetLastError());
-        strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-        WSACleanup();
-        return -1;
-    }
-
-    DWORD timeout = 10000;
-    setsockopt(test_sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    setsockopt(test_sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
-
-    memset(&proxy_addr, 0, sizeof(proxy_addr));
-    proxy_addr.sin_family = AF_INET;
-    proxy_addr.sin_addr.s_addr = resolve_hostname(g_proxy_host);
-    proxy_addr.sin_port = htons(g_proxy_port);
-
-    snprintf(temp_buffer, sizeof(temp_buffer), "Connecting to proxy %s:%d...\n", g_proxy_host, g_proxy_port);
-    strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-
-    if (connect(test_sock, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)) == SOCKET_ERROR)
-    {
-        snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Failed to connect to proxy (%d)\n", WSAGetLastError());
-        strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-        closesocket(test_sock);
-        WSACleanup();
-        return -1;
-    }
-
-    strncat_s(result_buffer, buffer_size, "Connected to proxy server\n", _TRUNCATE);
-
-    if (g_proxy_type == PROXY_TYPE_SOCKS5)
-    {
-        if (socks5_connect(test_sock, target_ip, target_port) != 0)
-        {
-            snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: SOCKS5 handshake failed\n");
-            strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-            closesocket(test_sock);
-            WSACleanup();
-            return -1;
-        }
-        strncat_s(result_buffer, buffer_size, "SOCKS5 handshake successful\n", _TRUNCATE);
-    }
-    else
-    {
-        if (http_connect(test_sock, target_ip, target_port) != 0)
-        {
-            snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: HTTP CONNECT failed\n");
-            strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-            closesocket(test_sock);
-            WSACleanup();
-            return -1;
-        }
-        strncat_s(result_buffer, buffer_size, "HTTP CONNECT successful\n", _TRUNCATE);
-    }
-
-
-    char http_request[FILTER_BUFFER_SIZE];
-    snprintf(http_request, sizeof(http_request),
-        "GET / HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Connection: close\r\n"
-        "User-Agent: ProxyBridge/1.0\r\n"
-        "\r\n", target_host);
-
-    if (send(test_sock, http_request, strlen(http_request), 0) == SOCKET_ERROR)
-    {
-        snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Failed to send test request (%d)\n", WSAGetLastError());
-        strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-        closesocket(test_sock);
-        WSACleanup();
-        return -1;
-    }
-
-    strncat_s(result_buffer, buffer_size, "Sent HTTP GET request\n", _TRUNCATE);
-    char response[1024];
-    int bytes_received = recv(test_sock, response, sizeof(response) - 1, 0);
-    if (bytes_received > 0)
-    {
-        response[bytes_received] = '\0';
-
-        if (strstr(response, "HTTP/") != NULL)
-        {
-            char* status_line = strstr(response, "HTTP/");
-            int status_code = 0;
-            if (status_line != NULL)
-            {
-                sscanf_s(status_line, "HTTP/%*s %d", &status_code);
-            }
-
-            snprintf(temp_buffer, sizeof(temp_buffer), "SUCCESS: Received HTTP %d response (%d bytes)\n", status_code, bytes_received);
-            strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-            ret = 0; // Success
-        }
-        else
-        {
-            snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Received data but not valid HTTP response\n");
-            strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-            ret = -1; // Failure - not a valid HTTP response
-        }
-    }
-    else if (bytes_received == 0)
-    {
-        snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Connection closed by remote host (no data received)\n");
-        strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-        ret = -1; // Failure
-    }
-    else
-    {
-        int error_code = WSAGetLastError();
-        if (error_code == WSAETIMEDOUT)
-        {
-            snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Connection timeout - no response received\n");
-        }
-        else
-        {
-            snprintf(temp_buffer, sizeof(temp_buffer), "ERROR: Failed to receive response (%d)\n", error_code);
-        }
-        strncat_s(result_buffer, buffer_size, temp_buffer, _TRUNCATE);
-        ret = -1; // Failure
-    }
-
-    closesocket(test_sock);
-    WSACleanup();
-
-    if (ret == 0)
-    {
-        strncat_s(result_buffer, buffer_size, "\n✓ Proxy connection test PASSED\n", _TRUNCATE);
-    }
-    else
-    {
-        strncat_s(result_buffer, buffer_size, "\n✗ Proxy connection test FAILED\n", _TRUNCATE);
-    }
-
-    return ret;
-}
-
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
 {
     switch (fdwReason)
@@ -3247,6 +3290,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
         case DLL_PROCESS_DETACH:
             if (running)
                 ProxyBridge_Stop();
+            // Close all proxy config UDP sockets
+            for (int i = 0; i < g_proxy_config_count; i++)
+            {
+                PROXY_CONFIG *cfg = &g_proxy_configs[i];
+                if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  cfg->udp_tcp_ctrl  = INVALID_SOCKET; }
+                if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
+            }
             if (lock != NULL)
             {
                 CloseHandle(lock);

@@ -7,18 +7,24 @@ using ProxyBridge.GUI.ViewModels;
 
 namespace ProxyBridge.GUI.Services;
 
+public class ProxyConfigEntry
+{
+    public uint Id { get; set; }
+    public string Type { get; set; } = "SOCKS5";
+    public string Host { get; set; } = "";
+    public string Port { get; set; } = "";
+    public string Username { get; set; } = "";
+    public string Password { get; set; } = "";
+}
+
 public class AppConfig
 {
-    public string ProxyType { get; set; } = "SOCKS5";
-    public string ProxyIp { get; set; } = "";
-    public string ProxyPort { get; set; } = "";
-    public string ProxyUsername { get; set; } = "";
-    public string ProxyPassword { get; set; } = "";
     public bool DnsViaProxy { get; set; } = true;
-    public bool LocalhostViaProxy { get; set; } = false;  // Default: disabled
+    public bool LocalhostViaProxy { get; set; } = false;
     public bool IsTrafficLoggingEnabled { get; set; } = true;
     public string Language { get; set; } = "en";
     public bool CloseToTray { get; set; } = true;
+    public List<ProxyConfigEntry> ProxyConfigs { get; set; } = new();
     public List<ProxyRuleConfig> ProxyRules { get; set; } = new();
 }
 
@@ -30,9 +36,12 @@ public class ProxyRuleConfig
     public string Protocol { get; set; } = "TCP";
     public string Action { get; set; } = "PROXY";
     public bool IsEnabled { get; set; } = true;
+    public uint ProxyConfigId { get; set; } = 0;
 }
 
 [JsonSerializable(typeof(AppConfig))]
+[JsonSerializable(typeof(ProxyConfigEntry))]
+[JsonSerializable(typeof(List<ProxyConfigEntry>))]
 [JsonSerializable(typeof(ProxyRuleConfig))]
 [JsonSerializable(typeof(List<ProxyRuleConfig>))]
 internal partial class AppConfigJsonContext : JsonSerializerContext
@@ -118,6 +127,8 @@ public static class ConfigManager
             if (config != null)
             {
                 config.ProxyRules ??= new List<ProxyRuleConfig>();
+                config.ProxyConfigs ??= new List<ProxyConfigEntry>();
+
                 return config;
             }
         }

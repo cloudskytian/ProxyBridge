@@ -49,16 +49,37 @@ public class ProxyBridgeService : IDisposable
         return !_isRunning;
     }
 
-    public bool SetProxyConfig(string type, string ip, ushort port, string username, string password)
+    public uint AddProxyConfig(string type, string ip, ushort port, string username, string password)
     {
         var proxyType = type.ToUpper() == "HTTP"
             ? ProxyBridgeNative.ProxyType.HTTP
             : ProxyBridgeNative.ProxyType.SOCKS5;
 
-        return ProxyBridgeNative.ProxyBridge_SetProxyConfig(proxyType, ip, port, username, password);
+        return ProxyBridgeNative.ProxyBridge_AddProxyConfig(proxyType, ip, port, username, password);
     }
 
-    public uint AddRule(string processName, string targetHosts, string targetPorts, string protocol, string action)
+    public bool EditProxyConfig(uint configId, string type, string ip, ushort port, string username, string password)
+    {
+        var proxyType = type.ToUpper() == "HTTP"
+            ? ProxyBridgeNative.ProxyType.HTTP
+            : ProxyBridgeNative.ProxyType.SOCKS5;
+
+        return ProxyBridgeNative.ProxyBridge_EditProxyConfig(configId, proxyType, ip, port, username, password);
+    }
+
+    public bool DeleteProxyConfig(uint configId)
+    {
+        return ProxyBridgeNative.ProxyBridge_DeleteProxyConfig(configId);
+    }
+
+    public string TestProxyConfig(uint configId, string targetHost, ushort targetPort)
+    {
+        var buffer = new System.Text.StringBuilder(4096);
+        ProxyBridgeNative.ProxyBridge_TestProxyConfig(configId, targetHost, targetPort, buffer, (UIntPtr)buffer.Capacity);
+        return buffer.ToString();
+    }
+
+    public uint AddRule(string processName, string targetHosts, string targetPorts, string protocol, string action, uint proxyConfigId = 0)
     {
         var ruleAction = action.ToUpper() switch
         {
@@ -75,7 +96,7 @@ public class ProxyBridgeService : IDisposable
             _ => ProxyBridgeNative.RuleProtocol.TCP
         };
 
-        return ProxyBridgeNative.ProxyBridge_AddRule(processName, targetHosts, targetPorts, ruleProtocol, ruleAction);
+        return ProxyBridgeNative.ProxyBridge_AddRule(processName, targetHosts, targetPorts, ruleProtocol, ruleAction, proxyConfigId);
     }
 
     public bool EnableRule(uint ruleId)
@@ -93,7 +114,7 @@ public class ProxyBridgeService : IDisposable
         return ProxyBridgeNative.ProxyBridge_DeleteRule(ruleId);
     }
 
-    public bool EditRule(uint ruleId, string processName, string targetHosts, string targetPorts, string protocol, string action)
+    public bool EditRule(uint ruleId, string processName, string targetHosts, string targetPorts, string protocol, string action, uint proxyConfigId = 0)
     {
         var ruleAction = action.ToUpper() switch
         {
@@ -110,7 +131,7 @@ public class ProxyBridgeService : IDisposable
             _ => ProxyBridgeNative.RuleProtocol.TCP
         };
 
-        return ProxyBridgeNative.ProxyBridge_EditRule(ruleId, processName, targetHosts, targetPorts, ruleProtocol, ruleAction);
+        return ProxyBridgeNative.ProxyBridge_EditRule(ruleId, processName, targetHosts, targetPorts, ruleProtocol, ruleAction, proxyConfigId);
     }
 
     public uint GetRulePosition(uint ruleId)
@@ -136,18 +157,6 @@ public class ProxyBridgeService : IDisposable
     public static void SetTrafficLoggingEnabled(bool enable)
     {
         ProxyBridgeNative.ProxyBridge_SetTrafficLoggingEnabled(enable);
-    }
-
-    public string TestConnection(string targetHost, ushort targetPort)
-    {
-        var buffer = new System.Text.StringBuilder(4096);
-        int result = ProxyBridgeNative.ProxyBridge_TestConnection(
-            targetHost,
-            targetPort,
-            buffer,
-            (UIntPtr)buffer.Capacity);
-
-        return buffer.ToString();
     }
 
     public void Dispose()

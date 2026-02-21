@@ -56,7 +56,8 @@ public static class ProxyBridgeNative
         [MarshalAs(UnmanagedType.LPStr)] string targetHosts,
         [MarshalAs(UnmanagedType.LPStr)] string targetPorts,
         RuleProtocol protocol,
-        RuleAction action);
+        RuleAction action,
+        uint proxyConfigId);
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -67,8 +68,7 @@ public static class ProxyBridgeNative
     public static extern bool ProxyBridge_DisableRule(uint ruleId);
 
     [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool ProxyBridge_SetProxyConfig(
+    public static extern uint ProxyBridge_AddProxyConfig(
         ProxyType type,
         [MarshalAs(UnmanagedType.LPStr)] string proxyIp,
         ushort proxyPort,

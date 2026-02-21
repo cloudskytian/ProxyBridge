@@ -37,11 +37,7 @@ public class MainWindowViewModel : ViewModelBase
     private bool _isServiceInitialized = false;
     private readonly SettingsService _settingsService = new SettingsService();
 
-    private string _currentProxyType = "SOCKS5";
-    private string _currentProxyIp = "";
-    private string _currentProxyPort = "";
-    private string _currentProxyUsername = "";
-    private string _currentProxyPassword = "";
+    public ObservableCollection<ProxyConfig> ProxyConfigs { get; } = new();
 
     private readonly List<string> _pendingConnectionLogs = new(128);
     private readonly List<string> _pendingActivityLogs = new(64);
@@ -123,16 +119,15 @@ public class MainWindowViewModel : ViewModelBase
 
             _proxyService.SetDnsViaProxy(_dnsViaProxy);
             _proxyService.SetLocalhostViaProxy(_localhostViaProxy);
-            if (!string.IsNullOrEmpty(_currentProxyIp) &&
-                !string.IsNullOrEmpty(_currentProxyPort) &&
-                ushort.TryParse(_currentProxyPort, out ushort portNum))
+
+            foreach (var pc in ProxyConfigs)
             {
-                _proxyService.SetProxyConfig(
-                    _currentProxyType,
-                    _currentProxyIp,
-                    portNum,
-                    _currentProxyUsername,
-                    _currentProxyPassword);
+                if (!string.IsNullOrWhiteSpace(pc.Host) && ushort.TryParse(pc.Port, out ushort pcPort))
+                {
+                    uint assignedId = _proxyService.AddProxyConfig(pc.Type, pc.Host, pcPort, pc.Username, pc.Password);
+                    if (assignedId > 0)
+                        pc.Id = assignedId;
+                }
             }
 
             if (_proxyService.Start())
@@ -144,7 +139,8 @@ public class MainWindowViewModel : ViewModelBase
                         rule.TargetHosts,
                         rule.TargetPorts,
                         rule.Protocol,
-                        rule.Action);
+                        rule.Action,
+                        rule.ProxyConfigId);
 
                     if (ruleId > 0)
                     {
@@ -397,38 +393,10 @@ public class MainWindowViewModel : ViewModelBase
             var window = new ProxySettingsWindow();
 
             var viewModel = new ProxySettingsViewModel(
-                initialType: _currentProxyType,
-                initialIp: _currentProxyIp,
-                initialPort: _currentProxyPort,
-                initialUsername: _currentProxyUsername,
-                initialPassword: _currentProxyPassword,
-                onSave: (type, ip, port, username, password) =>
-                {
-                    if (_proxyService != null && ushort.TryParse(port, out ushort portNum))
-                    {
-                        if (_proxyService.SetProxyConfig(type, ip, portNum, username, password))
-                        {
-
-                            _currentProxyType = type;
-                            _currentProxyIp = ip;
-                            _currentProxyPort = port;
-                            _currentProxyUsername = username;
-                            _currentProxyPassword = password;
-
-                            SaveConfigurationInternal();
-                        }
-                        else
-                        {
-                            QueueActivityLog("ERROR: Failed to set proxy config");
-                        }
-                    }
-                    window.Close();
-                },
-                onClose: () =>
-                {
-                    window.Close();
-                },
-                proxyService: _proxyService
+                proxyConfigs: ProxyConfigs,
+                proxyService: _proxyService,
+                onConfigsChanged: SaveConfigurationInternal,
+                onClose: () => window.Close()
             );
 
             window.DataContext = viewModel;
@@ -445,6 +413,7 @@ public class MainWindowViewModel : ViewModelBase
 
             var viewModel = new ProxyRulesViewModel(
                 proxyRules: ProxyRules,
+                availableProxyConfigs: ProxyConfigs,
                 onAddRule: (rule) =>
                 {
                     if (_proxyService != null)
@@ -454,7 +423,8 @@ public class MainWindowViewModel : ViewModelBase
                             rule.TargetHosts,
                             rule.TargetPorts,
                             rule.Protocol,
-                            rule.Action);
+                            rule.Action,
+                            rule.ProxyConfigId);
                         if (ruleId > 0)
                         {
                             rule.RuleId = ruleId;
@@ -721,12 +691,6 @@ public class MainWindowViewModel : ViewModelBase
 
             var config = ConfigManager.LoadConfig();
 
-            _currentProxyType = ValidationHelper.DefaultIfEmpty(config.ProxyType, "SOCKS5");
-            _currentProxyIp = ValidationHelper.DefaultIfEmpty(config.ProxyIp, "");
-            _currentProxyPort = ValidationHelper.DefaultIfEmpty(config.ProxyPort, "");
-            _currentProxyUsername = config.ProxyUsername ?? "";
-            _currentProxyPassword = config.ProxyPassword ?? "";
-
             DnsViaProxy = config.DnsViaProxy;
             LocalhostViaProxy = config.LocalhostViaProxy;
             CloseToTray = config.CloseToTray;
@@ -740,6 +704,23 @@ public class MainWindowViewModel : ViewModelBase
                 ChineseCheckmark = config.Language == "zh" ? "✓" : "";
             }
 
+            if (config.ProxyConfigs != null)
+            {
+                foreach (var pc in config.ProxyConfigs)
+                {
+                    if (string.IsNullOrWhiteSpace(pc.Host)) continue;
+                    ProxyConfigs.Add(new ProxyConfig
+                    {
+                        Id = pc.Id,
+                        Type = pc.Type,
+                        Host = pc.Host,
+                        Port = pc.Port,
+                        Username = pc.Username ?? "",
+                        Password = pc.Password ?? ""
+                    });
+                }
+            }
+
             if (config.ProxyRules != null && config.ProxyRules.Count > 0)
             {
                 foreach (var ruleConfig in config.ProxyRules)
@@ -747,6 +728,9 @@ public class MainWindowViewModel : ViewModelBase
                     if (string.IsNullOrWhiteSpace(ruleConfig.ProcessName))
                         continue;
 
+                    var pc = ruleConfig.ProxyConfigId > 0
+                        ? ProxyConfigs.FirstOrDefault(p => p.Id == ruleConfig.ProxyConfigId)
+                        : null;
                     var rule = new ProxyRule
                     {
                         ProcessName = ruleConfig.ProcessName,
@@ -754,7 +738,9 @@ public class MainWindowViewModel : ViewModelBase
                         TargetPorts = ValidationHelper.DefaultIfEmpty(ruleConfig.TargetPorts),
                         Protocol = ValidationHelper.DefaultIfEmpty(ruleConfig.Protocol, "TCP"),
                         Action = ValidationHelper.DefaultIfEmpty(ruleConfig.Action, "PROXY"),
-                        IsEnabled = ruleConfig.IsEnabled
+                        IsEnabled = ruleConfig.IsEnabled,
+                        ProxyConfigId = ruleConfig.ProxyConfigId,
+                        ProxyConfigDisplay = pc?.DisplayName ?? ""
                     };
                     ProxyRules.Add(rule);
                 }
@@ -779,16 +765,20 @@ public class MainWindowViewModel : ViewModelBase
         {
             var config = new AppConfig
             {
-                ProxyType = _currentProxyType,
-                ProxyIp = _currentProxyIp,
-                ProxyPort = _currentProxyPort,
-                ProxyUsername = _currentProxyUsername,
-                ProxyPassword = _currentProxyPassword,
                 DnsViaProxy = _dnsViaProxy,
                 LocalhostViaProxy = _localhostViaProxy,
                 IsTrafficLoggingEnabled = _isTrafficLoggingEnabled,
                 Language = _currentLanguage,
                 CloseToTray = _closeToTray,
+                ProxyConfigs = ProxyConfigs.Select(pc => new ProxyConfigEntry
+                {
+                    Id = pc.Id,
+                    Type = pc.Type,
+                    Host = pc.Host,
+                    Port = pc.Port,
+                    Username = pc.Username,
+                    Password = pc.Password
+                }).ToList(),
                 ProxyRules = ProxyRules.Select(r => new ProxyRuleConfig
                 {
                     ProcessName = r.ProcessName,
@@ -796,7 +786,8 @@ public class MainWindowViewModel : ViewModelBase
                     TargetPorts = r.TargetPorts,
                     Protocol = r.Protocol,
                     Action = r.Action,
-                    IsEnabled = r.IsEnabled
+                    IsEnabled = r.IsEnabled,
+                    ProxyConfigId = r.ProxyConfigId
                 }).ToList()
             };
 
@@ -865,8 +856,30 @@ public class ProxyRule : ViewModelBase
     public string Action
     {
         get => _action;
-        set => SetProperty(ref _action, value);
+        set
+        {
+            if (SetProperty(ref _action, value))
+                OnPropertyChanged(nameof(ActionDisplay));
+        }
     }
+
+    private uint _proxyConfigId;
+    public uint ProxyConfigId
+    {
+        get => _proxyConfigId;
+        set => SetProperty(ref _proxyConfigId, value);
+    }
+
+    private string _proxyConfigDisplay = "";
+    public string ProxyConfigDisplay
+    {
+        get => _proxyConfigDisplay;
+        set => SetProperty(ref _proxyConfigDisplay, value);
+    }
+
+    public string ActionDisplay => Action == "PROXY"
+        ? (string.IsNullOrEmpty(_proxyConfigDisplay) ? "PROXY" : _proxyConfigDisplay)
+        : Action;
 
     public bool IsEnabled
     {
@@ -879,4 +892,64 @@ public class ProxyRule : ViewModelBase
         get => _isSelected;
         set => SetProperty(ref _isSelected, value);
     }
+}
+
+public class ProxyConfig : ViewModelBase
+{
+    private uint _id;
+    private string _type = "SOCKS5";
+    private string _host = "";
+    private string _port = "";
+    private string _username = "";
+    private string _password = "";
+
+    public uint Id
+    {
+        get => _id;
+        set => SetProperty(ref _id, value);
+    }
+
+    public string Type
+    {
+        get => _type;
+        set
+        {
+            if (SetProperty(ref _type, value))
+                OnPropertyChanged(nameof(DisplayName));
+        }
+    }
+
+    public string Host
+    {
+        get => _host;
+        set
+        {
+            if (SetProperty(ref _host, value))
+                OnPropertyChanged(nameof(DisplayName));
+        }
+    }
+
+    public string Port
+    {
+        get => _port;
+        set
+        {
+            if (SetProperty(ref _port, value))
+                OnPropertyChanged(nameof(DisplayName));
+        }
+    }
+
+    public string Username
+    {
+        get => _username;
+        set => SetProperty(ref _username, value);
+    }
+
+    public string Password
+    {
+        get => _password;
+        set => SetProperty(ref _password, value);
+    }
+
+    public string DisplayName => $"{_type} {_host}:{_port}";
 }

@@ -69,23 +69,15 @@ public partial class ProxyRulesWindow : Window
 
     private void ViewModel_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (sender is ProxyRulesViewModel vm)
+        if (sender is ProxyRulesViewModel vm && e.PropertyName == nameof(ProxyRulesViewModel.NewProtocol))
         {
-            if (e.PropertyName == nameof(ProxyRulesViewModel.NewProtocol))
-            {
-                UpdateProtocolComboBox(vm.NewProtocol);
-            }
-            else if (e.PropertyName == nameof(ProxyRulesViewModel.NewProxyAction))
-            {
-                UpdateActionComboBox(vm.NewProxyAction);
-            }
+            UpdateProtocolComboBox(vm.NewProtocol);
         }
     }
 
     private void UpdateComboBoxSelections(ProxyRulesViewModel vm)
     {
         UpdateProtocolComboBox(vm.NewProtocol);
-        UpdateActionComboBox(vm.NewProxyAction);
     }
 
     private void UpdateProtocolComboBox(string protocol)
@@ -106,42 +98,6 @@ public partial class ProxyRulesWindow : Window
             }
 
             _isUpdatingFromViewModel = false;
-        }
-    }
-
-    private void UpdateActionComboBox(string action)
-    {
-        if (this.FindControl<ComboBox>("ActionComboBox") is ComboBox actionComboBox)
-        {
-            _isUpdatingFromViewModel = true;
-
-            foreach (var item in actionComboBox.Items)
-            {
-                if (item is ComboBoxItem comboBoxItem &&
-                    comboBoxItem.Tag is string tag &&
-                    tag.Equals(action, StringComparison.OrdinalIgnoreCase))
-                {
-                    actionComboBox.SelectedItem = comboBoxItem;
-                    break;
-                }
-            }
-
-            _isUpdatingFromViewModel = false;
-        }
-    }
-
-    private void ActionComboBox_SelectionChanged(object? sender, SelectionChangedEventArgs e)
-    {
-        // dont update ViewModel when updating from Viewmodel
-        if (_isUpdatingFromViewModel)
-            return;
-
-        if (sender is ComboBox comboBox &&
-            comboBox.SelectedItem is ComboBoxItem item &&
-            item.Tag is string tag &&
-            DataContext is ProxyRulesViewModel vm)
-        {
-            vm.NewProxyAction = tag;
         }
     }
 

@@ -15,7 +15,7 @@ public class ProxyRuleImport
     public bool Enabled { get; set; } = true;
 }
 
-// JSON Source Generator for NativeAOT compatibility
+// json source gen for nativeaot
 [JsonSerializable(typeof(List<ProxyRuleImport>))]
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 public partial class ProxyRuleJsonContext : JsonSerializerContext
@@ -179,12 +179,7 @@ class Program
                 parsedRules.AddRange(fileRules);
             }
 
-            // Only register callbacks when verbose level needs them
-            // -v 0: No callbacks at all -> disable traffic logging
-            // -v 1: Only log messages
-            // -v 2: Only connection events
-            // -v 3: Both logs and connections
-
+            // 1=logs, 2=connections, 3=both, 0=nothing
             if (_verboseLevel == 1 || _verboseLevel == 3)
             {
                 _logCallback = OnLog;
@@ -197,7 +192,6 @@ class Program
                 ProxyBridgeNative.ProxyBridge_SetConnectionCallback(_connectionCallback);
             }
 
-            // Disable traffic logging if no callbacks registered (prevents memory leak)
             bool enableTrafficLogging = _verboseLevel > 0;
             ProxyBridgeNative.ProxyBridge_SetTrafficLoggingEnabled(enableTrafficLogging);
 
@@ -209,12 +203,12 @@ class Program
             Console.WriteLine($"DNS via Proxy: {(dnsViaProxy ? "Enabled" : "Disabled")}");
             Console.WriteLine($"Localhost via Proxy: {(localhostViaProxy ? "Enabled" : "Disabled (Security: most proxies block localhost)")}");
 
-            if (!ProxyBridgeNative.ProxyBridge_SetProxyConfig(
+            if (ProxyBridgeNative.ProxyBridge_AddProxyConfig(
                 proxyInfo.Type,
                 proxyInfo.Host,
                 proxyInfo.Port,
                 proxyInfo.Username ?? "",
-                proxyInfo.Password ?? ""))
+                proxyInfo.Password ?? "") == 0)
             {
                 Console.WriteLine("ERROR: Failed to set proxy configuration");
                 return 1;
@@ -233,7 +227,8 @@ class Program
                         rule.TargetHosts,
                         rule.TargetPorts,
                         rule.Protocol,
-                        rule.Action);
+                        rule.Action,
+                        0u);
 
                     if (ruleId > 0)
                     {
@@ -283,7 +278,6 @@ class Program
 
     private static void OnLog(string message)
     {
-        // Verbose 1 = logs only, Verbose 3 = both
         if (_verboseLevel is 1 or 3)
         {
             Console.Write("[LOG] ");
@@ -293,7 +287,6 @@ class Program
 
     private static void OnConnection(string processName, uint pid, string destIp, ushort destPort, string proxyInfo)
     {
-        // Verbose 2 = connections only, Verbose 3 = both
         if (_verboseLevel is 2 or 3)
         {
             Console.WriteLine($"[CONN] {processName} (PID:{pid}) -> {destIp}:{destPort} via {proxyInfo}");
@@ -387,7 +380,7 @@ class Program
 
         foreach (var rule in rules)
         {
-            // Split by colon, but limit to 5 parts to allow colons in other fields if needed
+            // limit to 5 so colons in paths dont break parsing
             var parts = rule.Split(':', 5);
             if (parts.Length != 5)
             {
@@ -444,7 +437,6 @@ class Program
         ShowBanner();
         Console.WriteLine("Checking for updates...\n");
 
-        // Get version from assembly
         var currentVersion = System.Reflection.Assembly.GetExecutingAssembly()
             .GetName().Version?.ToString(3) ?? "0.0.0";
 
@@ -494,8 +486,7 @@ class Program
                 return;
             }
 
-            // Check if Windows installer exists before showing update available
-            // (handles cross-platform releases where v4.0 might be released for Linux only)
+            // skip if no windows installer in release (might be linux-only release)
             var assets = root.GetProperty("assets").EnumerateArray();
             string? setupUrl = null;
             string? setupName = null;

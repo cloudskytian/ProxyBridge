@@ -226,11 +226,12 @@
                                                VerticalAlignment="Center"
                                                Margin="0,0,10,0"/>
                                     <TextBlock Grid.Column="8"
-                                               Text="{Binding Action}"
+                                               Text="{Binding ActionDisplay}"
                                                FontSize="14"
                                                FontWeight="SemiBold"
                                                Foreground="#FF4EC9B0"
-                                               VerticalAlignment="Center"/>
+                                               VerticalAlignment="Center"
+                                               TextTrimming="CharacterEllipsis"/>
                                 </Grid>
                             </Border>
                         </DataTemplate>
@@ -306,10 +307,13 @@
                     <TextBlock Text="{Binding Loc.ActionLabel}" Classes="label"/>
                     <ComboBox HorizontalAlignment="Stretch"
                               x:Name="ActionComboBox"
-                              SelectionChanged="ActionComboBox_SelectionChanged">
-                        <ComboBoxItem Content="{Binding Loc.ActionProxy}" Tag="PROXY"/>
-                        <ComboBoxItem Content="{Binding Loc.ActionDirect}" Tag="DIRECT"/>
-                        <ComboBoxItem Content="{Binding Loc.ActionBlock}" Tag="BLOCK"/>
+                              ItemsSource="{Binding AvailableActions}"
+                              SelectedItem="{Binding SelectedRuleAction}">
+                        <ComboBox.ItemTemplate>
+                            <DataTemplate x:DataType="vm:RuleActionItem">
+                                <TextBlock Text="{Binding Label}"/>
+                            </DataTemplate>
+                        </ComboBox.ItemTemplate>
                     </ComboBox>
                 </StackPanel>
 
