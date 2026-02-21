@@ -90,13 +90,14 @@ typedef struct PID_CACHE_ENTRY {
 typedef struct {
     UINT32 config_id;           // Unique ID (1-based), 0 = unused slot
     ProxyType type;
-    char host[256];             // Hostname or IP
+    char host[256];
     UINT16 port;
     char username[256];
     char password[256];
-    ULONGLONG last_udp_attempt; // Rate-limit UDP ASSOCIATE retry per config
-    SOCKET udp_tcp_ctrl;        // TCP control socket for SOCKS5 UDP ASSOCIATE
-    SOCKET udp_send_sock;       // UDP socket for sending/receiving via this proxy
+    UINT32 resolved_ip;         // cached at add/edit time - avoids DNS per connection
+    ULONGLONG last_udp_attempt;
+    SOCKET udp_tcp_ctrl;
+    SOCKET udp_send_sock;
     struct sockaddr_in udp_relay_addr;
     BOOL udp_connected;
 } PROXY_CONFIG;
@@ -109,16 +110,16 @@ static CONNECTION_INFO *connection_hash_table[CONNECTION_HASH_SIZE] = {NULL};
 static LOGGED_CONNECTION *logged_connections = NULL;
 static PROCESS_RULE *rules_list = NULL;
 static UINT32 g_next_rule_id = 1;
-static HANDLE lock = NULL;
+static SRWLOCK lock;
 static HANDLE windivert_handle = INVALID_HANDLE_VALUE;
 static HANDLE packet_thread[NUM_PACKET_THREADS] = {NULL};
 static HANDLE proxy_thread = NULL;
 static HANDLE udp_relay_thread = NULL;
 static HANDLE cleanup_thread = NULL;
 static PID_CACHE_ENTRY *pid_cache[PID_CACHE_SIZE] = {NULL};
-static BOOL g_has_active_rules = FALSE;
+static volatile BOOL g_has_active_rules = FALSE;
 static SOCKET udp_relay_socket = INVALID_SOCKET;
-static BOOL running = FALSE;
+static volatile BOOL running = FALSE;
 static DWORD g_current_process_id = 0;
 
 static BOOL g_traffic_logging_enabled = TRUE;
@@ -249,6 +250,7 @@ static RuleAction match_rule(const char *process_name, UINT32 dest_ip, UINT16 de
 static RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UINT16 dest_port, BOOL is_udp, DWORD *out_pid, UINT32 *out_proxy_config_id);
 static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id);
 static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port);
+static BOOL get_connection_full(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id);
 static UINT32 get_connection_proxy_id(UINT16 src_port);
 static BOOL is_connection_tracked(UINT16 src_port);
 static void remove_connection(UINT16 src_port);
@@ -1842,8 +1844,7 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
                                (recv_buf[6] << 16) | (recv_buf[7] << 24);
                 UINT16 src_port = (recv_buf[8] << 8) | recv_buf[9];
 
-                // Find which local port to deliver to via reverse lookup
-                WaitForSingleObject(lock, INFINITE);
+                AcquireSRWLockShared(&lock);
                 struct sockaddr_in target_addr;
                 BOOL found = FALSE;
                 UINT32 target_ip = 0;
@@ -1864,7 +1865,7 @@ static DWORD WINAPI udp_relay_server(LPVOID arg)
                         conn = conn->next;
                     }
                 }
-                ReleaseMutex(lock);
+                ReleaseSRWLockShared(&lock);
 
                 if (found)
                 {
@@ -1972,13 +1973,12 @@ static DWORD WINAPI local_proxy_server(LPVOID arg)
 
 
         UINT16 client_port = ntohs(client_addr.sin_port);
-        if (!get_connection(client_port, &conn_config->orig_dest_ip, &conn_config->orig_dest_port))
+        if (!get_connection_full(client_port, &conn_config->orig_dest_ip, &conn_config->orig_dest_port, &conn_config->proxy_config_id))
         {
             closesocket(client_sock);
             free(conn_config);
             continue;
         }
-        conn_config->proxy_config_id = get_connection_proxy_id(client_port);
 
         HANDLE conn_thread = CreateThread(NULL, 1, connection_handler,
                                           (LPVOID)conn_config, 0, NULL);
@@ -2007,7 +2007,6 @@ static DWORD WINAPI connection_handler(LPVOID arg)
     UINT32 proxy_config_id = config->proxy_config_id;
     SOCKET socks_sock;
     struct sockaddr_in socks_addr;
-    UINT32 proxy_ip;
 
     free(config);
 
@@ -2020,8 +2019,8 @@ static DWORD WINAPI connection_handler(LPVOID arg)
         return 1;
     }
 
-    // Connect to proxy
-    proxy_ip = resolve_hostname(proxy->host);
+    // Connect to proxy, use cached resolved IP to avoid DNS per connection
+    UINT32 proxy_ip = proxy->resolved_ip ? proxy->resolved_ip : resolve_hostname(proxy->host);
     if (proxy_ip == 0)
     {
         closesocket(client_sock);
@@ -2071,8 +2070,6 @@ static DWORD WINAPI connection_handler(LPVOID arg)
         }
     }
 
-    //
-    // Reduces thread count by 50% and CPU usage significantly
     TRANSFER_CONFIG *transfer_config = (TRANSFER_CONFIG *)malloc(sizeof(TRANSFER_CONFIG));
 
     if (transfer_config == NULL)
@@ -2166,7 +2163,7 @@ cleanup:
 
 static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT16 dest_port, UINT32 proxy_config_id)
 {
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
 
     int hash = src_port % CONNECTION_HASH_SIZE;
     CONNECTION_INFO *existing = connection_hash_table[hash];
@@ -2174,13 +2171,12 @@ static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT1
     // check if already exists in this hash bucket
     while (existing != NULL) {
         if (existing->src_port == src_port) {
-            // Update existing entry
             existing->src_ip = src_ip;
             existing->orig_dest_ip = dest_ip;
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
-            ReleaseMutex(lock);
+            ReleaseSRWLockExclusive(&lock);
             return;
         }
         existing = existing->next;
@@ -2188,7 +2184,7 @@ static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT1
 
     CONNECTION_INFO *conn = (CONNECTION_INFO *)malloc(sizeof(CONNECTION_INFO));
     if (conn == NULL) {
-        ReleaseMutex(lock);
+        ReleaseSRWLockExclusive(&lock);
         return;
     }
 
@@ -2200,19 +2196,16 @@ static void add_connection(UINT16 src_port, UINT32 src_ip, UINT32 dest_ip, UINT1
     conn->is_tracked = TRUE;
     conn->last_activity = GetTickCount64();
 
-    // insert at head of hash bucket
-    //reuse hash variable from lookup above
     conn->next = connection_hash_table[hash];
     connection_hash_table[hash] = conn;
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 static BOOL is_connection_tracked(UINT16 src_port)
 {
     BOOL tracked = FALSE;
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockShared(&lock);
 
-    // Hash table lookup - O(1)
     int hash = src_port % CONNECTION_HASH_SIZE;
     CONNECTION_INFO *conn = connection_hash_table[hash];
 
@@ -2223,7 +2216,7 @@ static BOOL is_connection_tracked(UINT16 src_port)
         }
         conn = conn->next;
     }
-    ReleaseMutex(lock);
+    ReleaseSRWLockShared(&lock);
     return tracked;
 }
 
@@ -2231,7 +2224,7 @@ static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port)
 {
     BOOL found = FALSE;
 
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockShared(&lock);
 
     int hash = src_port % CONNECTION_HASH_SIZE;
     CONNECTION_INFO *conn = connection_hash_table[hash];
@@ -2242,13 +2235,40 @@ static BOOL get_connection(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port)
         {
             *dest_ip = conn->orig_dest_ip;
             *dest_port = conn->orig_dest_port;
-            conn->last_activity = GetTickCount64();  // Update activity to prevent stale cleanup
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
             found = TRUE;
             break;
         }
         conn = conn->next;
     }
-    ReleaseMutex(lock);
+    ReleaseSRWLockShared(&lock);
+
+    return found;
+}
+
+static BOOL get_connection_full(UINT16 src_port, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id)
+{
+    BOOL found = FALSE;
+
+    AcquireSRWLockShared(&lock);
+
+    int hash = src_port % CONNECTION_HASH_SIZE;
+    CONNECTION_INFO *conn = connection_hash_table[hash];
+
+    while (conn != NULL)
+    {
+        if (conn->src_port == src_port)
+        {
+            *dest_ip = conn->orig_dest_ip;
+            *dest_port = conn->orig_dest_port;
+            if (proxy_config_id != NULL) *proxy_config_id = conn->proxy_config_id;
+            InterlockedExchange64((LONGLONG volatile*)&conn->last_activity, (LONGLONG)GetTickCount64());
+            found = TRUE;
+            break;
+        }
+        conn = conn->next;
+    }
+    ReleaseSRWLockShared(&lock);
 
     return found;
 }
@@ -2257,7 +2277,7 @@ static UINT32 get_connection_proxy_id(UINT16 src_port)
 {
     UINT32 proxy_config_id = 0;
 
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockShared(&lock);
 
     int hash = src_port % CONNECTION_HASH_SIZE;
     CONNECTION_INFO *conn = connection_hash_table[hash];
@@ -2271,14 +2291,14 @@ static UINT32 get_connection_proxy_id(UINT16 src_port)
         }
         conn = conn->next;
     }
-    ReleaseMutex(lock);
+    ReleaseSRWLockShared(&lock);
 
     return proxy_config_id;
 }
 
 static void remove_connection(UINT16 src_port)
 {
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
 
     int hash = src_port % CONNECTION_HASH_SIZE;
     CONNECTION_INFO **conn_ptr = &connection_hash_table[hash];
@@ -2294,18 +2314,16 @@ static void remove_connection(UINT16 src_port)
         }
         conn_ptr = &(*conn_ptr)->next;
     }
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 static void cleanup_stale_connections(void)
 {
     ULONGLONG now = GetTickCount64();
-    int removed = 0;
 
-    // Process each hash bucket with minimal lock time
     for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
     {
-        WaitForSingleObject(lock, INFINITE);
+        AcquireSRWLockExclusive(&lock);
         CONNECTION_INFO **conn_ptr = &connection_hash_table[i];
 
         while (*conn_ptr != NULL)
@@ -2314,25 +2332,22 @@ static void cleanup_stale_connections(void)
             {
                 CONNECTION_INFO *to_free = *conn_ptr;
                 *conn_ptr = (*conn_ptr)->next;
-                ReleaseMutex(lock);
-                free(to_free);  // Free outside lock
-                removed++;
-                WaitForSingleObject(lock, INFINITE);
+                ReleaseSRWLockExclusive(&lock);
+                free(to_free);
+                AcquireSRWLockExclusive(&lock);
             }
             else
             {
                 conn_ptr = &(*conn_ptr)->next;
             }
         }
-        ReleaseMutex(lock);
+        ReleaseSRWLockExclusive(&lock);
     }
 
-    // Cleanup PID cache with separate lock acquisitions
     ULONGLONG now_cache = GetTickCount64();
-    int cache_removed = 0;
     for (int i = 0; i < PID_CACHE_SIZE; i++)
     {
-        WaitForSingleObject(lock, INFINITE);
+        AcquireSRWLockExclusive(&lock);
         PID_CACHE_ENTRY **entry_ptr = &pid_cache[i];
         while (*entry_ptr != NULL)
         {
@@ -2340,42 +2355,33 @@ static void cleanup_stale_connections(void)
             {
                 PID_CACHE_ENTRY *to_free = *entry_ptr;
                 *entry_ptr = (*entry_ptr)->next;
-                ReleaseMutex(lock);
-                free(to_free);  // Free outside lock
-                cache_removed++;
-                WaitForSingleObject(lock, INFINITE);
+                ReleaseSRWLockExclusive(&lock);
+                free(to_free);
+                AcquireSRWLockExclusive(&lock);
             }
             else
             {
                 entry_ptr = &(*entry_ptr)->next;
             }
         }
-        ReleaseMutex(lock);
+        ReleaseSRWLockExclusive(&lock);
     }
 
-    // keep only last 100 for memory efficiency // 100 will keep speed upto the mark
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
     int logged_count = 0;
     LOGGED_CONNECTION *temp = logged_connections;
-    while (temp != NULL)
-    {
-        logged_count++;
-        temp = temp->next;
-    }
+    while (temp != NULL) { logged_count++; temp = temp->next; }
 
     if (logged_count > 100)
     {
         temp = logged_connections;
         for (int i = 0; i < 99 && temp != NULL; i++)
-        {
             temp = temp->next;
-        }
 
         if (temp != NULL)
         {
             LOGGED_CONNECTION *to_free_list = temp->next;
-            temp->next = NULL;  // Cut the list
-
+            temp->next = NULL;
             while (to_free_list != NULL)
             {
                 LOGGED_CONNECTION *next = to_free_list->next;
@@ -2384,8 +2390,7 @@ static void cleanup_stale_connections(void)
             }
         }
     }
-
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 PROXYBRIDGE_API UINT32 ProxyBridge_AddRule(const char* process_name, const char* target_hosts, const char* target_ports, RuleProtocol protocol, RuleAction action, UINT32 proxy_config_id)
@@ -2682,6 +2687,7 @@ PROXYBRIDGE_API UINT32 ProxyBridge_AddProxyConfig(ProxyType type, const char* pr
     cfg->type      = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
     cfg->port      = proxy_port;
     strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
+    cfg->resolved_ip = resolve_hostname(proxy_ip);
     if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
     if (password != NULL) strncpy_s(cfg->password, sizeof(cfg->password), password, _TRUNCATE);
     cfg->udp_tcp_ctrl  = INVALID_SOCKET;
@@ -2714,6 +2720,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_EditProxyConfig(UINT32 config_id, ProxyType typ
             cfg->type = (type == PROXY_TYPE_HTTP) ? PROXY_TYPE_HTTP : PROXY_TYPE_SOCKS5;
             cfg->port = proxy_port;
             strncpy_s(cfg->host, sizeof(cfg->host), proxy_ip, _TRUNCATE);
+            cfg->resolved_ip = resolve_hostname(proxy_ip);
             cfg->username[0] = '\0';
             cfg->password[0] = '\0';
             if (username != NULL) strncpy_s(cfg->username, sizeof(cfg->username), username, _TRUNCATE);
@@ -2865,7 +2872,7 @@ PROXYBRIDGE_API void ProxyBridge_ClearConnectionLogs(void)
 static BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action)
 {
     BOOL found = FALSE;
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockShared(&lock);
 
     LOGGED_CONNECTION *logged = logged_connections;
     while (logged != NULL)
@@ -2881,49 +2888,38 @@ static BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_
         logged = logged->next;
     }
 
-    ReleaseMutex(lock);
+    ReleaseSRWLockShared(&lock);
     return found;
 }
 
 
-// Memory usage and cpu usage are limitation of the ProxyBridge arch
-// Relay server takes huge amount of memory and cpu and add extra hops
-// hops can cuase slight delay in network speed
-// relay server are ippoved to process it as fast as possible with minimal impact on memory usage
-
 static void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action)
 {
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
 
     int count = 0;
     LOGGED_CONNECTION *temp = logged_connections;
-    while (temp != NULL)
-    {
-        count++;
-        temp = temp->next;
-    }
+    while (temp != NULL) { count++; temp = temp->next; }
 
     if (count >= 100)
     {
         temp = logged_connections;
         for (int i = 0; i < 98 && temp != NULL; i++)
-        {
             temp = temp->next;
-        }
 
         if (temp != NULL && temp->next != NULL)
         {
             LOGGED_CONNECTION *to_free_list = temp->next;
             temp->next = NULL;
 
-            ReleaseMutex(lock);
+            ReleaseSRWLockExclusive(&lock);
             while (to_free_list != NULL)
             {
                 LOGGED_CONNECTION *next = to_free_list->next;
                 free(to_free_list);
                 to_free_list = next;
             }
-            WaitForSingleObject(lock, INFINITE);
+            AcquireSRWLockExclusive(&lock);
         }
     }
 
@@ -2938,12 +2934,12 @@ static void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, R
         logged_connections = logged;
     }
 
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 static void clear_logged_connections(void)
 {
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
 
     while (logged_connections != NULL)
     {
@@ -2952,7 +2948,7 @@ static void clear_logged_connections(void)
         free(to_free);
     }
 
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 //  cache pid
@@ -2971,7 +2967,7 @@ static DWORD get_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
     ULONGLONG current_time = GetTickCount64();
     DWORD pid = 0;
 
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockShared(&lock);
 
     PID_CACHE_ENTRY *entry = pid_cache[hash];
     while (entry != NULL)
@@ -2980,20 +2976,13 @@ static DWORD get_cached_pid(UINT32 src_ip, UINT16 src_port, BOOL is_udp)
             entry->src_port == src_port &&
             entry->is_udp == is_udp)
         {
-            if (current_time - entry->timestamp < PID_CACHE_TTL_MS)
-            {
-                pid = entry->pid;
-                break;
-            }
-            else
-            {
-                break;
-            }
+            pid = (current_time - entry->timestamp < PID_CACHE_TTL_MS) ? entry->pid : 0;
+            break;
         }
         entry = entry->next;
     }
 
-    ReleaseMutex(lock);
+    ReleaseSRWLockShared(&lock);
     return pid;
 }
 
@@ -3002,7 +2991,7 @@ static void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp)
     UINT32 hash = pid_cache_hash(src_ip, src_port, is_udp);
     ULONGLONG current_time = GetTickCount64();
 
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
 
     PID_CACHE_ENTRY *entry = pid_cache[hash];
     while (entry != NULL)
@@ -3013,7 +3002,7 @@ static void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp)
         {
             entry->pid = pid;
             entry->timestamp = current_time;
-            ReleaseMutex(lock);
+            ReleaseSRWLockExclusive(&lock);
             return;
         }
         entry = entry->next;
@@ -3031,12 +3020,12 @@ static void cache_pid(UINT32 src_ip, UINT16 src_port, DWORD pid, BOOL is_udp)
         pid_cache[hash] = new_entry;
     }
 
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 static void clear_pid_cache(void)
 {
-    WaitForSingleObject(lock, INFINITE);
+    AcquireSRWLockExclusive(&lock);
 
     for (int i = 0; i < PID_CACHE_SIZE; i++)
     {
@@ -3048,7 +3037,7 @@ static void clear_pid_cache(void)
         }
     }
 
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 }
 
 // Dedicated cleanup thread - runs independently without blocking packet processing
@@ -3088,12 +3077,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Start(void)
     if (running)
         return FALSE;
 
-    if (lock == NULL)
-    {
-        lock = CreateMutex(NULL, FALSE, NULL);
-        if (lock == NULL)
-            return FALSE;
-    }
+    InitializeSRWLock(&lock);
 
     running = TRUE;
 
@@ -3254,9 +3238,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
         udp_relay_thread = NULL;
     }
 
-    WaitForSingleObject(lock, INFINITE);
-    // free all connections in hash table
-    // avoid unwanted data and free the memory
+    AcquireSRWLockExclusive(&lock);
     for (int i = 0; i < CONNECTION_HASH_SIZE; i++)
     {
         while (connection_hash_table[i] != NULL)
@@ -3266,7 +3248,7 @@ PROXYBRIDGE_API BOOL ProxyBridge_Stop(void)
             free(to_free);
         }
     }
-    ReleaseMutex(lock);
+    ReleaseSRWLockExclusive(&lock);
 
     // Clear logged connections list
     clear_logged_connections();
@@ -3296,11 +3278,6 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved)
                 PROXY_CONFIG *cfg = &g_proxy_configs[i];
                 if (cfg->udp_tcp_ctrl != INVALID_SOCKET)  { closesocket(cfg->udp_tcp_ctrl);  cfg->udp_tcp_ctrl  = INVALID_SOCKET; }
                 if (cfg->udp_send_sock != INVALID_SOCKET) { closesocket(cfg->udp_send_sock); cfg->udp_send_sock = INVALID_SOCKET; }
-            }
-            if (lock != NULL)
-            {
-                CloseHandle(lock);
-                lock = NULL;
             }
             while (rules_list != NULL)
             {
